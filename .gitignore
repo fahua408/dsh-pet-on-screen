@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller / Build outputs
+dist/
+build/
+_build/
+*.spec
+*.manifest
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# Logs & Cache
+*.log
+*.log.*
+*.tmp
+temp/
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+scratch/
+
+# Release Archives
+*.zip
+*.7z
+*.rar

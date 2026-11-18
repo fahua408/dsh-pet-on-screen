@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=640, height=480, initial-scale=1.0, user-scalable=no" />
+  <title>大肥鱼桌宠钛坦屏投放舞台</title>
+  <link rel="stylesheet" href="stage.css" />
+</head>
+<body class="mode-dual layout-side_by_side">
+  <!-- 消除 WebM 1/255 底色残留的 SVG 线性变换滤镜 -->
+  <svg width="0" height="0" style="position: absolute; pointer-events: none;">
+    <defs>
+      <filter id="dsh-pet-alpha-fix">
+        <feComponentTransfer>
+          <feFuncA type="linear" slope="1" intercept="-0.0039215686" />
+        </feComponentTransfer>
+      </filter>
+    </defs>
+  </svg>
+
+  <!-- 640×480 物理画幅根容器 -->
+  <div id="viewport">
+    <!-- 背景图层 -->
+    <div id="bg-layer"></div>
+
+    <!-- Coopanion (大肥鱼) 专属容器 -->
+    <div id="coopanion-container" class="pet-panel">
+      <iframe id="coopanion-frame" src="about:blank" frameborder="0" scrolling="no"></iframe>
+      <div id="coopanion-offline" class="coop-offline-tip hidden">
+        <div class="tip-icon">🐟</div>
+        <div class="tip-title">大肥鱼离线中</div>
+        <div class="tip-sub">请在控制中心一键拉起 Coopanion</div>
+      </div>
+    </div>
+
+    <!-- DeepSeek dsh-pet (蓝毛女仆) 专属容器 -->
+    <div id="dsh-container" class="pet-panel">
+      <!-- 状态指示微胶囊 (左上角) -->
+      <div id="hud-bar">
+        <div id="balance-pill" class="hud-pill hidden">
+          <span class="hud-icon">💰</span>
+          <span id="balance-text">¥0.00</span>
+        </div>
+        <div id="status-pill" class="hud-pill hidden">
+          <span class="hud-dot"></span>
+          <span id="status-text">就绪</span>
+        </div>
+      </div>
+
+      <!-- 顶部台词与碎碎念气泡 -->
+      <div id="bubble-container" class="bubble hidden">
+        <div id="bubble-meme-wrapper" class="bubble-meme hidden">
+          <img id="bubble-meme-img" src="" alt="meme" />
+        </div>
+        <div class="bubble-body">
+          <div id="bubble-text">大肥鱼正在待机中...</div>
+        </div>
+        <div class="bubble-tail"></div>
+      </div>
+
+      <!-- 宠物双缓冲 WebM 视频舞台 -->
+      <div id="pet-stage">
+        <video id="video-a" class="pet-video is-front" muted playsinline></video>
+        <video id="video-b" class="pet-video" muted playsinline></video>
+      </div>
+    </div>
+  </div>
+
+  <script src="stage.js"></script>
+</body>
+</html>

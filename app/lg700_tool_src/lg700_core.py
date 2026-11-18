@@ -1,0 +1,681 @@
+"""TCOMAS LG700 / LG600 native boot-asset protocol, Windows HID.
+
+Reverse engineered from the owner's device (REV 0067) and vendor V75.
+This module never updates executable firmware. It exposes asset commands and
+the vendor's 0x1E offline display-mode setting (only values 0 and 1).
+"""
+from __future__ import annotations
+import hashlib
+import io
+import json
+import logging
+import math
+import os
+import struct
+import time
+from pathlib import Path
+from device_profiles import (LG700_PROFILE, PROFILES, resolve_profile, profile_for_info,
+    is_command_interface, connection_identity, backup_device_key, manifest_profile,
+    check_manifest_device)
+
+VID, PID = 0x1A2C, 0x151C
+SECTOR = 65536
+REGIONS = {1: (0x400000, 0xF00000), 0: (0xF00000, 0x1000000)}
+CMD_PAYLOAD = 436
+MAX_PACKETS = 50
+MAX_JPEG = 200_000
+# Observed native records use either no extra attributes or the paired 0x6000
+# attributes. Keep the original bytes in backups; do not normalize these bits.
+BOOT_ROOT_TAGS = frozenset({0x1000, 0x7000})
+BOOT_FRAME_FLAGS = frozenset({0x0000, 0x6000})
+READ_CHUNK = 8192
+WRITE_CHUNK = 8192
+COMMAND_SETTLE_SECONDS = 0.015
+READ_ONLY_ATTEMPTS = 3
+RESYNC_QUIET_MS = 25
+RESYNC_MAX_SECONDS = 1.0
+RESYNC_BACKOFF_SECONDS = (0.017, 0.031)
+log = logging.getLogger('lg700.transport')
+
+
+def open_command_transport(path):
+    if os.name == 'nt':
+        from windows_hid import WindowsHID
+        transport = WindowsHID()
+    else:
+        import hid
+        transport = hid.device()
+    transport.open_path(path)
+    return transport
+
+
+class ReadResponseError(OSError):
+    """A read-only response did not match the requested offset or length."""
+
+
+class ResponseSyncError(TimeoutError):
+    """Reports arrived, but a complete response could not be assembled."""
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def checksum_record(a, b, c, flags=0):
+    return (-(a + b + c + (flags & 0xFFF))) & 0xFFFFFFFF
+
+
+def pack_boot(jpegs: list[bytes]) -> bytes:
+    """Original 16-byte file records, ASCII names, baseline JPEG payloads."""
+    if not 1 <= len(jpegs) <= 4095:
+        raise ValueError("动画必须包含 1–4095 帧")
+    offset = 17 + 16 * len(jpegs)
+    table, body = bytearray(), bytearray()
+    for n, jpeg in enumerate(jpegs):
+        if not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
+            raise ValueError(f"第 {n} 帧 JPEG 不完整")
+        if len(jpeg) > MAX_JPEG:
+            raise ValueError(f"第 {n} 帧超过 200 KB")
+        name = f"{n}.jpg\0".encode("ascii")
+        check = checksum_record(offset, len(jpeg), len(name))
+        table += struct.pack("<IIIHH", check, offset, len(jpeg), len(name), 0)
+        body += name + jpeg
+        offset += len(name) + len(jpeg)
+    # The final empty directory record is part of the original container.
+    size, table_size, flags = offset, len(table), 0x1000 | len(jpegs)
+    header = struct.pack("<IIIHH", checksum_record(size, table_size, 1, flags),
+                         size, table_size, 1, flags)
+    terminal = struct.pack("<IIIHH", 0, 0, 0, 0, 0x1000)
+    return header + b"\0" + table + body + terminal
+
+
+def validate_jpeg(data, profile, label):
+    from PIL import Image
+    if not data.startswith(b'\xff\xd8') or not data.endswith(b'\xff\xd9'):
+        raise ValueError(f'{label} JPEG 缺少起始或结束标记')
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format != 'JPEG' or image.size != profile.size or image.info.get('progressive'):
+                raise ValueError(f'{label}必须是 {profile.dimensions} 非渐进 JPEG；'
+                                 f'收到 {image.format} {image.width}×{image.height}，'
+                                 f'渐进编码={bool(image.info.get("progressive"))}')
+            image.load()
+    except (OSError, Image.DecompressionBombError) as error:
+        raise ValueError(f'{label} JPEG 解码失败') from error
+
+
+def unpack_boot(data: bytes, inspect_jpeg=True, *, profile=None) -> list[bytes]:
+    profile = resolve_profile(profile)
+    if len(data) < 33:
+        raise ValueError("动画包太短")
+    check, size, table_size, prefix, flags = struct.unpack_from("<IIIHH", data)
+    count = flags & 0xFFF
+    if check != checksum_record(size, table_size, prefix, flags):
+        raise ValueError("动画包头校验失败")
+    if flags & 0xF000 not in BOOT_ROOT_TAGS or not count:
+        raise ValueError("不是支持的原厂动画格式")
+    if size != len(data) - 16 or table_size != count * 16:
+        raise ValueError("动画包长度或帧表错误")
+    if prefix != 1 or data[16] != 0:
+        raise ValueError(f'动画目录前缀无效：长度应为 1，收到 {prefix}，且前缀必须为 0')
+    table_start = 16 + prefix
+    table_end = table_start + table_size
+    if table_end > len(data):
+        raise ValueError("帧表越界")
+    frames, previous_end = [], table_end
+    for n in range(count):
+        check, off, length, name_len, frame_flags = struct.unpack_from(
+            "<IIIHH", data, table_start + 16 * n)
+        if check != checksum_record(off, length, name_len, frame_flags):
+            raise ValueError(f"第 {n} 帧记录校验失败")
+        if frame_flags not in BOOT_FRAME_FLAGS:
+            raise ValueError(f"第 {n} 帧记录标志不受支持")
+        end = off + name_len + length
+        if off < previous_end or not name_len or end > len(data):
+            raise ValueError(f"第 {n} 帧偏移越界或重叠")
+        if not data[off:off + name_len].endswith(b"\0"):
+            raise ValueError(f"第 {n} 帧名称损坏")
+        jpeg = data[off + name_len:end]
+        if not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
+            raise ValueError(f"第 {n} 帧 JPEG 损坏")
+        if length > MAX_JPEG:
+            raise ValueError(f"第 {n} 帧过大")
+        if inspect_jpeg:
+            validate_jpeg(jpeg, profile, f'开机动画第 {n + 1} 帧')
+        frames.append(jpeg)
+        previous_end = end
+    if data[previous_end:] != struct.pack("<IIIHH", 0, 0, 0, 0, 0x1000):
+        raise ValueError("动画包结束记录损坏")
+    return frames
+
+
+def capacity(selector, profile=None):
+    begin, end = resolve_profile(profile).regions[selector]
+    return end - begin - 20  # storage record is outside the animation container
+
+
+def is_empty_boot(meta, profile=None):
+    """Recognize the observed empty boot record, not arbitrary zero lengths."""
+    begin, _ = resolve_profile(profile).regions[1]
+    return (meta.get('selector') == 1 and meta.get('size') == 0
+            and meta.get('active_record') == 0xFFFFFFFF
+            and meta.get('next_record') == begin and meta.get('extra') == 0)
+
+
+def _read_backup_asset(directory, selector, saved, profile):
+    directory = Path(directory).resolve()
+    file = (directory / saved['file']).resolve()
+    # Packaged Windows apps may redirect a file into LocalCache while
+    # resolving its parent directory keeps the logical LocalAppData path.
+    # Compare directory identities as well as names before rejecting it.
+    if (not file.is_relative_to(directory)
+            and not any(directory.samefile(parent) for parent in file.parents)):
+        raise ValueError(f"备份文件路径超出所选目录：{saved['file']}")
+    data = file.read_bytes()
+    if sha256(data) != saved['sha256']:
+        raise ValueError(f"素材备份 SHA-256 校验失败：{saved['file']}")
+    if saved.get('empty') is True:
+        if selector != 1 or data or not is_empty_boot(saved, profile):
+            raise ValueError('备份的空动画槽记录无效')
+    if 'size' in saved and saved['size'] != len(data):
+        raise ValueError(f"备份文件长度与清单不一致：{saved['file']}，"
+                         f"清单 {saved['size']} 字节，文件 {len(data)} 字节")
+    if 'selector' in saved and saved['selector'] != selector:
+        raise ValueError(f"备份素材区域不匹配：{saved['file']}，应为 {selector}，收到 {saved['selector']}")
+    if not data and saved.get('empty') is not True:
+        raise ValueError('备份文件为空，且没有有效的空动画槽记录')
+    if data:
+        validate_asset(selector, data, profile=profile)
+    return data
+
+
+def validate_asset(selector, data, *, profile=None):
+    profile = resolve_profile(profile)
+    if selector not in profile.regions:
+        raise ValueError("只允许开机动画和待机图区域")
+    begin, end = profile.regions[selector]
+    required = ((len(data) + 3) // 4 * 4 + 20 + SECTOR - 1) // SECTOR * SECTOR
+    if not data or begin + required > end:
+        raise ValueError(f"素材超过分区容量：{len(data):,} 字节")
+    if selector == 1:
+        unpack_boot(data, profile=profile)
+    else:
+        validate_jpeg(data, profile, '待机图')
+
+
+def encode_reports(op, payload=b""):
+    count = max(1, math.ceil(len(payload) / CMD_PAYLOAD))
+    if not 0 <= op <= 255 or count > MAX_PACKETS:
+        raise ValueError("命令过大")
+    for seq in range(count):
+        head = (0x80000000 | count << 8 | op) if seq == 0 else (seq << 8 | op)
+        chunk = payload[seq * CMD_PAYLOAD:(seq + 1) * CMD_PAYLOAD]
+        yield b"\0" + struct.pack("<I", head) + chunk.ljust(CMD_PAYLOAD, b"\0")
+
+
+class LG700:
+    """Legacy class name retained; a profile selects each supported model."""
+    def __init__(self, profile=None, expected_identity=None):
+        import hid
+        self.hid = None
+        self._mutex = None
+        self._kernel = None
+        requested = resolve_profile(profile) if profile is not None else None
+        devices = []
+        for candidate in PROFILES:
+            if requested is not None and candidate != requested:
+                continue
+            devices.extend(d for d in hid.enumerate(candidate.vid, candidate.pid)
+                           if is_command_interface(d))
+        devices = list({connection_identity(d): d for d in devices}.values())
+        if len(devices) != 1:
+            raise RuntimeError(f"需要恰好一台目标屏幕，检测到 {len(devices)} 台；"
+                               "可选择型号后重新识别，或仅连接一台 LG700 / LG600")
+        self.info = devices[0]
+        self._profile = profile_for_info(self.info)
+        if expected_identity is not None and connection_identity(self.info) != expected_identity:
+            raise RuntimeError('转换期间目标设备已变化，请重新识别后再写入')
+        try:
+            if os.name == 'nt':
+                import ctypes
+                from ctypes import wintypes
+                self._kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+                self._kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+                self._kernel.CreateMutexW.restype = wintypes.HANDLE
+                self._kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+                self._kernel.WaitForSingleObject.restype = wintypes.DWORD
+                self._kernel.ReleaseMutex.argtypes = [wintypes.HANDLE]
+                self._kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+                handle = self._kernel.CreateMutexW(None, False, 'Local\\TCOMAS_LG700_Asset_IO')
+                if not handle:
+                    raise OSError('无法创建屏幕通信锁')
+                status = self._kernel.WaitForSingleObject(handle, 0)
+                if status not in (0, 0x80):
+                    self._kernel.CloseHandle(handle)
+                    raise RuntimeError('另一个写入工具正在使用屏幕，请等待它完成后重试')
+                self._mutex = handle
+            self.hid = open_command_transport(self.info["path"])
+            self.revision = struct.unpack_from("<H", self.query(0x87))[0]
+        except Exception:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    @property
+    def profile(self):
+        return getattr(self, '_profile', LG700_PROFILE)
+
+    def note_unverified_revision(self):
+        """Revision history is advisory; actual protocol checks govern attempts."""
+        if (self.revision not in self.profile.known_revisions and
+                getattr(self, '_noted_revision', None) != self.revision):
+            log.warning('%s REV %04X is unverified; attempting the existing protocol '
+                        'with backup, format, capacity, response and readback checks',
+                        self.profile.name, self.revision)
+            self._noted_revision = self.revision
+
+    def close(self):
+        try:
+            if self.hid is not None:
+                self.hid.close()
+                self.hid = None
+        finally:
+            if self._mutex is not None:
+                self._kernel.ReleaseMutex(self._mutex)
+                self._kernel.CloseHandle(self._mutex)
+                self._mutex = None
+
+    def query(self, op, payload=b"", timeout_ms=6000):
+        # A completed host read can precede the firmware's command cleanup.
+        # Pace complete commands, preserving report bytes and 8 KiB chunks.
+        # Only version and metadata probes can be repeated here. Asset reads
+        # recover at read_asset(), which also checks the unchanged asset identity.
+        # Erase, write, commit and mode commands always have exactly one attempt.
+        attempts = READ_ONLY_ATTEMPTS if op in (0x87, 0x0C) else 1
+        for attempt in range(attempts):
+            remaining = COMMAND_SETTLE_SECONDS - (time.monotonic() - getattr(self, '_last_query_finished', 0))
+            if remaining > 0:
+                time.sleep(remaining)
+            try:
+                return self._query(op, payload, timeout_ms if attempt == 0 else min(timeout_ms, 1200))
+            except (ResponseSyncError, TimeoutError) as error:
+                if attempt + 1 == attempts:
+                    raise
+                discarded = self._drain_input()
+                delay = RESYNC_BACKOFF_SECONDS[attempt]
+                log.warning('Read-only probe resync op=%02X attempt=%d discarded=%d backoff=%.3f: %s',
+                            op, attempt + 1, discarded, delay, error)
+                self.transport_resyncs = getattr(self, 'transport_resyncs', 0) + 1
+                time.sleep(delay)
+            finally:
+                self._last_query_finished = time.monotonic()
+
+    def _drain_input(self):
+        """Wait for a quiet receive interval, bounded by time and report count."""
+        deadline = time.monotonic() + RESYNC_MAX_SECONDS
+        for discarded in range(MAX_PACKETS * 2):
+            if time.monotonic() >= deadline:
+                break
+            raw = bytes(self.hid.read(440, RESYNC_QUIET_MS))
+            if not raw:
+                return discarded
+        raise OSError('命令口持续返回旧数据，已停止；请让屏幕彻底断电后重试')
+
+    def _query(self, op, payload=b"", timeout_ms=6000):
+        if op == 0x1E:
+            if payload not in (b'\x00', b'\x01'):
+                raise ValueError('离线播放模式只允许 0 或 1')
+        elif op not in (0x0A, 0x0B, 0x0C, 0x0D, 0x87):
+            raise ValueError("该工具不发送此类命令")
+        for seq, report in enumerate(encode_reports(op, payload)):
+            sent = self.hid.write(report)
+            if sent != 441:
+                raise OSError(f'命令 0x{op:02X} 第 {seq + 1} 个 HID 报告发送长度异常：'
+                              f'应为 441 字节，发送 {sent} 字节；结果未知，未自动重发')
+        if op == 0x1E:
+            # Vendor dispatch schedules persistence and returns without an ACK.
+            # Waiting here invents a timeout, even when the command succeeded.
+            return b''
+        deadline = time.monotonic() + timeout_ms / 1000
+        last_unexpected = None
+        while True:
+            remaining = max(1, int((deadline - time.monotonic()) * 1000))
+            # After a stray continuation, wait for one quiet interval instead
+            # of repeatedly landing on the same device timer phase six seconds
+            # later. Never invent a missing header or accept a partial response.
+            wait_ms = remaining if last_unexpected is None else min(remaining, RESYNC_QUIET_MS)
+            raw = bytes(self.hid.read(440, wait_ms))
+            if not raw:
+                detail = f'；最后收到旧包头 0x{last_unexpected:08X}' if last_unexpected is not None else ''
+                error = ResponseSyncError if last_unexpected is not None else TimeoutError
+                raise error(f"命令 0x{op:02X} 等待响应超时{detail}")
+            if len(raw) != 440:
+                raise ResponseSyncError(f'命令 0x{op:02X} 响应长度错误：应为 440 字节，收到 {len(raw)} 字节')
+            head = struct.unpack_from("<I", raw)[0]
+            if head & 0xFF == op and head & 0x80000000:
+                break
+            last_unexpected = head
+            log.warning('Discarded unrelated packet while waiting for op=%02X: header=%08X', op, head)
+            if time.monotonic() >= deadline:
+                raise ResponseSyncError("收到其他命令响应，请退出原厂软件后重试")
+        count = (head & 0x7FFFFFFF) >> 8
+        if not 1 <= count <= MAX_PACKETS:
+            raise ResponseSyncError(f'命令 0x{op:02X} 设备返回无效包数：{count}；允许 1–{MAX_PACKETS}')
+        if op != 0x0D and count != 1:
+            raise ResponseSyncError(f'命令 0x{op:02X} 设备返回的应答包数与命令不符：应为 1，收到 {count}')
+        chunks = [raw[4:]]
+        for seq in range(1, count):
+            remaining = max(1, int((deadline - time.monotonic()) * 1000))
+            raw = bytes(self.hid.read(440, remaining))
+            expected = seq << 8 | op
+            if len(raw) != 440:
+                raise ResponseSyncError(f'命令 0x{op:02X} 第 {seq + 1}/{count} 个响应包长度错误：'
+                                        f'应为 440 字节，收到 {len(raw)} 字节')
+            actual = struct.unpack_from('<I', raw)[0]
+            if actual != expected:
+                raise ResponseSyncError(f'命令 0x{op:02X} 响应包顺序错误：{seq + 1}/{count}；'
+                                        f'应为 0x{expected:08X}，收到 0x{actual:08X}')
+            if time.monotonic() >= deadline:
+                raise ResponseSyncError(f'命令 0x{op:02X} 响应超过总等待时间')
+            chunks.append(raw[4:])
+        result = b"".join(chunks)
+        if op == 0x0D:
+            offset, requested, _ = struct.unpack_from('<IIi', payload)
+            received_offset, actual, status = struct.unpack_from('<IIi', result)
+            expected_packets = math.ceil((12 + requested) / CMD_PAYLOAD)
+            if (received_offset != offset or actual != requested or status < 0 or
+                    count != expected_packets or len(result) < 12 + requested):
+                message = (f'读取响应不匹配：请求 offset={offset}, length={requested}；'
+                           f'返回 offset={received_offset}, length={actual}, status={status}, '
+                           f'packets={count}/{expected_packets}')
+                log.error(message)
+                raise ReadResponseError(message)
+        return result
+
+    def _recover_read_session(self, original_meta):
+        """Discard leftover input, then reselect the same unchanged asset.
+
+        Only used for failed reads. It never retries write/commit/mode commands.
+        """
+        discarded = self._drain_input()
+        time.sleep(RESYNC_BACKOFF_SECONDS[0])
+        current = self.metadata(original_meta['selector'])
+        if self._asset_identity(current) != self._asset_identity(original_meta):
+            raise OSError('读取期间屏幕素材发生变化，已停止，不能混合保存新旧数据')
+        log.warning('Read-only recovery: discarded=%d, unchanged selector=%d', discarded, current['selector'])
+
+    @staticmethod
+    def _asset_identity(meta):
+        return tuple(meta[k] for k in ('selector', 'size', 'active_record', 'next_record'))
+
+    def _reconnect_command_interface(self, timeout=10):
+        """Only retry read-only probes; never resend the mode-setting command."""
+        import hid
+        expected_serial = self.info.get('serial_number')
+        expected_revision = self.revision
+        last_error = None
+        if self.hid is not None:
+            try:
+                self.hid.close()
+            except OSError:
+                pass
+            self.hid = None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            matches = [d for d in hid.enumerate(self.profile.vid, self.profile.pid)
+                       if is_command_interface(d)
+                       and ((expected_serial and d.get('serial_number') == expected_serial)
+                            or (not expected_serial and d.get('path') == self.info.get('path')))]
+            if len(matches) == 1:
+                try:
+                    self.hid = open_command_transport(matches[0]['path'])
+                    revision = struct.unpack_from('<H', self.query(0x87, timeout_ms=400))[0]
+                    if revision != expected_revision:
+                        raise RuntimeError('重新连接后固件版本变化，已停止')
+                    self.info = matches[0]
+                    return
+                except (OSError, TimeoutError) as error:
+                    last_error = error
+                    if self.hid is not None:
+                        self.hid.close()
+                        self.hid = None
+            time.sleep(.25)
+        raise TimeoutError(f'屏幕尚未重新连接（等待 {timeout:g} 秒）；未重复发送模式命令') from last_error
+
+    def set_offline_loop(self, enabled, backup_directory):
+        """Set native looping; a one-frame boot package stays visually static.
+
+        V75: 0x1E writes config[0x111], starts the boot task for mode 1,
+        and schedules configuration persistence. The protocol has no getter
+        for this byte, and this command has no acknowledgement.
+        """
+        self.note_unverified_revision()
+        directory = Path(backup_directory)
+        manifest = json.loads((directory / 'manifest.json').read_text(encoding='utf8'))
+        check_manifest_device(manifest, self.profile, revision=self.revision,
+                              info=getattr(self, 'info', None))
+        for selector, name in ((1, 'boot'), (0, 'standby')):
+            saved = manifest['assets'][name]
+            _read_backup_asset(directory, selector, saved, self.profile)
+        if enabled and manifest['assets']['boot'].get('empty') is True:
+            if is_empty_boot(self.metadata(1), self.profile):
+                raise ValueError('屏幕尚未保存开机动画，请先写入本地图片或视频，再设置离线播放')
+        audit = {'model': self.profile.key, 'revision': f'{self.revision:04X}', 'command': '0x1E',
+                 'mode': 1 if enabled else 0, 'previous_mode': None,
+                 'mode_readback_supported': False, 'acknowledged': False,
+                 'ack_expected': False, 'send_completed': False,
+                 'communication_verified': False,
+                 'device_reconnected': False,
+                 'visual_playback_verified': False, 'time_unix': time.time()}
+        audit_path = directory / 'playback_mode.json'
+        audit_path.write_text(json.dumps(audit, indent=2), encoding='utf8')
+        try:
+            self.query(0x1E, bytes([audit['mode']]))
+        except (OSError, TimeoutError) as error:
+            audit['error'] = f'{type(error).__name__}: {error}'
+            audit['result'] = 'unknown_after_send_do_not_retry_automatically'
+            audit_path.write_text(json.dumps(audit, indent=2), encoding='utf8')
+            raise RuntimeError('播放模式命令发送未完成，结果未知；没有重复发送，也未继续擦写。') from error
+        audit['send_completed'] = True
+        # The mode has no getter. A subsequent version probe checks only that
+        # commands are still processed; it is not an acknowledgement of the mode.
+        time.sleep(1)
+        try:
+            revision = struct.unpack_from('<H', self.query(0x87, timeout_ms=600))[0]
+            if revision != self.revision:
+                raise RuntimeError('模式命令后固件版本变化，已停止')
+        except (OSError, TimeoutError) as error:
+            audit['probe_error'] = f'{type(error).__name__}: {error}'
+            try:
+                self._reconnect_command_interface()
+            except Exception as reconnect_error:
+                audit['reconnect_error'] = str(reconnect_error)
+                audit_path.write_text(json.dumps(audit, indent=2), encoding='utf8')
+                raise RuntimeError('离线播放命令后屏幕未重新连接；素材备份已保留，'
+                                   '没有重复发送命令。') from reconnect_error
+            audit['device_reconnected'] = True
+        audit['communication_verified'] = True
+        audit['result'] = 'sent_without_ack_communication_verified_mode_byte_unreadable'
+        audit_path.write_text(json.dumps(audit, indent=2), encoding='utf8')
+        return audit
+
+    def metadata(self, selector):
+        raw = self.query(0x0C, struct.pack("<II", selector, 0))
+        sel, size, active, next_record, extra = struct.unpack_from("<IiIII", raw)
+        meta = dict(selector=sel, size=size, active_record=active,
+                    next_record=next_record, extra=extra)
+        if selector == 1 and is_empty_boot(meta, self.profile):
+            # Confirm the complete signature before allowing an initial write.
+            confirmed = self.query(0x0C, struct.pack('<II', selector, 0))
+            if struct.unpack_from('<IiIII', confirmed) != (sel, size, active, next_record, extra):
+                raise OSError('空动画槽元数据发生变化，已停止，请重新识别')
+            meta['empty'] = True
+            return meta
+        if sel != selector or not 0 < size <= capacity(selector, self.profile):
+            raise OSError(f"素材元数据异常：请求 selector={selector}，返回 selector={sel}, size={size}；"
+                          f"允许 1–{capacity(selector, self.profile)} 字节")
+        begin, end = self.profile.regions[selector]
+        if active < begin or active >= end or not active < next_record <= end:
+            raise OSError(f'素材地址与已知 {self.profile.name} 存储布局不符，已停止：selector={selector}，'
+                          f'active=0x{active:X}, next=0x{next_record:X}，分区=0x{begin:X}–0x{end:X}')
+        return meta
+
+    def read_boot_first_frame(self, progress=lambda p: None):
+        from first_frame import read_boot_first_frame
+        return read_boot_first_frame(self, progress)
+
+    def read_asset(self, selector, progress=lambda p: None):
+        meta = self.metadata(selector)
+        if selector == 1 and is_empty_boot(meta, self.profile):
+            progress(1)
+            return b'', meta
+        log.info('Read start selector=%d size=%d chunk=%d', selector, meta['size'], READ_CHUNK)
+        result = bytearray()
+        while len(result) < meta["size"]:
+            offset, count = len(result), min(READ_CHUNK, meta["size"] - len(result))
+            for attempt in range(2):
+                try:
+                    raw = self.query(0x0D, struct.pack("<IIi", offset, count, 0))
+                    off, actual, status = struct.unpack_from("<IIi", raw)
+                    if off != offset or actual != count or status < 0 or len(raw) < 12 + count:
+                        raise ReadResponseError(f'读取响应不匹配：请求 {offset}/{count}，返回 {off}/{actual}/{status}')
+                    break
+                except (OSError, TimeoutError) as error:
+                    log.warning('Read failure selector=%d offset=%d attempt=%d: %s', selector, offset, attempt + 1, error)
+                    if attempt:
+                        raise OSError(f'读取在 offset={offset} 失败，已停止本次操作：{error}') from error
+                    self._recover_read_session(meta)
+            result.extend(raw[12:12 + count])
+            progress(len(result) / meta["size"])
+        if self._asset_identity(self.metadata(selector)) != self._asset_identity(meta):
+            raise OSError('读取结束时素材元数据已改变，已拒绝保存本次读取结果')
+        log.info('Read complete selector=%d bytes=%d sha256=%s', selector, len(result), sha256(result))
+        return bytes(result), meta
+
+    def backup(self, directory, progress=lambda s, p: None):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=False)
+        manifest = {"device": {"vid": f'{self.profile.vid:04X}', "pid": f'{self.profile.pid:04X}',
+                    "model": self.profile.key, "size": list(self.profile.size),
+                    "device_key": backup_device_key(self.info, self.profile),
+                    "revision": f"{self.revision:04X}"}, "assets": {}}
+        for selector, name in [(1, "boot"), (0, "standby")]:
+            data, meta = self.read_asset(selector, lambda p: progress(name, p))
+            if selector == 1 and not data and is_empty_boot(meta, self.profile):
+                meta['empty'] = True
+                log.info('Backup: confirmed empty boot slot; preserving standby separately')
+            else:
+                validate_asset(selector, data, profile=self.profile)
+            file = directory / f"{name}.bin"
+            file.write_bytes(data)
+            # Verify the persisted backup before exposing it to the write operation.
+            if file.read_bytes() != data:
+                raise OSError(f'备份文件写入校验失败：{file}，目标 {len(data)} 字节')
+            meta.update(file=file.name, sha256=sha256(data))
+            manifest["assets"][name] = meta
+        (directory / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf8")
+        return manifest
+
+    def write_asset(self, selector, data, backup_directory, progress=lambda p: None,
+                    recovery=False):
+        """Normal writes need a fresh backup; recovery uses a verified source.
+
+        Commit is sent exactly once, with no blind retries.
+        """
+        self.last_write_skipped = False
+        self.last_verification_reconnected = False
+        validate_asset(selector, data, profile=self.profile)
+        self.note_unverified_revision()
+        directory = Path(backup_directory)
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf8"))
+        check_manifest_device(manifest, self.profile, revision=self.revision,
+                              info=getattr(self, 'info', None))
+        asset_name = "boot" if selector else "standby"
+        saved = manifest["assets"][asset_name]
+        previous = _read_backup_asset(directory, selector, saved, self.profile)
+        if recovery and saved.get('empty') is True:
+            raise ValueError('原始开机动画为空，无法恢复不存在的动画；请写入本地图片或视频')
+        if not recovery:
+            current_meta = self.metadata(selector)
+            for key in ('size', 'active_record', 'next_record'):
+                if key in saved and current_meta[key] != saved[key]:
+                    raise ValueError(f'备份后素材发生变化，请重新备份：selector={selector}，'
+                                     f'{key} 从 {saved[key]} 变为 {current_meta[key]}')
+            if previous == data:
+                # The backup suggests no change. Still read the entire live
+                # asset again: size/cursors alone cannot prove byte equality.
+                actual = self._read_for_verification(selector, progress)
+                if actual != data:
+                    raise ValueError('备份后素材内容发生变化，请重新备份；尚未开始擦写')
+                self.last_write_skipped = True
+                return sha256(actual)
+        log.info('Write start selector=%d size=%d chunk=%d sha256=%s', selector, len(data), WRITE_CHUNK, sha256(data))
+        try:
+            ack = self.query(0x0A, struct.pack("<II", selector, len(data)), timeout_ms=15000)
+        except (OSError, TimeoutError) as error:
+            log.exception('Write begin failed selector=%d size=%d', selector, len(data))
+            raise OSError(f'开始擦写失败：selector={selector}，目标 {len(data):,} 字节；结果未知，未自动重发：{error}') from error
+        which, accepted = struct.unpack_from("<Ii", ack)
+        if which != selector or accepted != len(data):
+            raise OSError(f'设备拒绝开始写入：请求 selector={selector}, size={len(data)}；'
+                          f'返回 selector={which}, size={accepted}。未发送素材')
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset:offset + WRITE_CHUNK]
+            final = offset + len(chunk) == len(data)
+            # Byte 8 is progress percentage; >=100 commits the storage record.
+            percent = 100 if final else min(99, (offset + len(chunk)) * 100 // len(data))
+            payload = struct.pack("<III", offset, len(chunk), percent) + chunk
+            if offset % SECTOR == 0 or final:
+                log.info('Write block selector=%d offset=%d length=%d percent=%d final=%s',
+                         selector, offset, len(chunk), percent, final)
+            try:
+                ack = self.query(0x0B, payload, timeout_ms=15000)
+            except (OSError, TimeoutError) as error:
+                log.exception('Write block failed selector=%d offset=%d length=%d final=%s',
+                              selector, offset, len(chunk), final)
+                state = '最后提交结果未知' if final else '开机素材可能尚未提交' if selector else '待机素材可能尚未提交'
+                raise OSError(f'写入中断：selector={selector}，offset={offset:,}，length={len(chunk):,}；'
+                              f'{state}，未自动重发。{error}') from error
+            off, length, status = struct.unpack_from("<IIi", ack)
+            if off != offset or length != len(chunk) or status < 0:
+                raise OSError(f'写入响应错误：selector={selector}，请求 offset={offset}, length={len(chunk)}；'
+                              f'返回 offset={off}, length={length}, status={status}。')
+            offset += len(chunk)
+            progress(offset / len(data))
+        actual = self._read_for_verification(selector, progress)
+        if actual != data:
+            raise OSError(f'写后读回内容不一致：selector={selector}，目标 {len(data):,} 字节，'
+                          f'读回 {len(actual):,} 字节，SHA-256 分别为 {sha256(data)} 和 {sha256(actual)}')
+        return sha256(actual)
+
+    def _read_for_verification(self, selector, progress):
+        try:
+            data, _ = self.read_asset(selector, lambda p: progress(1 + p))
+        except (OSError, TimeoutError):
+            # Native loop mode can reset USB just after a committed write.
+            # Reconnect and restart the complete read; never replay writes.
+            self._reconnect_command_interface()
+            self.last_verification_reconnected = True
+            data, _ = self.read_asset(selector, lambda p: progress(1 + p))
+        return data
+
+
+def restore_file(directory, selector, *, profile=None, allow_empty=False):
+    directory = Path(directory)
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf8"))
+    selected = manifest_profile(manifest) if profile is None else resolve_profile(profile)
+    check_manifest_device(manifest, selected)
+    name = "boot" if selector else "standby"
+    record = manifest["assets"][name]
+    data = _read_backup_asset(directory, selector, record, selected)
+    if record.get('empty') is True:
+        if not allow_empty:
+            raise ValueError('此备份中的原始开机动画为空，没有可恢复的动画；请写入本地图片或视频')
+        return data
+    return data

@@ -1,0 +1,33 @@
+{
+  "device": {
+    "vid": "1A2C",
+    "pid": "151C",
+    "model": "lg700",
+    "size": [
+      640,
+      480
+    ],
+    "device_key": "6f2c8908d8e2af3138a28b1f",
+    "revision": "0063"
+  },
+  "assets": {
+    "standby": {
+      "selector": 0,
+      "size": 102880,
+      "active_record": 15990784,
+      "next_record": 16121856,
+      "extra": 0,
+      "file": "standby.bin",
+      "sha256": "0e1004c022507b993edec7d112f4b614031dc6865ab870ce15c54067712b8fb4"
+    },
+    "boot": {
+      "selector": 1,
+      "size": 5406226,
+      "active_record": 4194304,
+      "next_record": 9633792,
+      "extra": 0,
+      "file": "boot.bin",
+      "sha256": "5d15bcef9bf31bb4eddfaa73e8427816dc27579c2a2fb6f46df3fd353d3a9b5a"
+    }
+  }
+}
