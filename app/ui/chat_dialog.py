@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""chat_dialog.py — 1:1 复刻 dsh-pet 原生暗黑胶囊多模态对话弹窗。
+"""chat_dialog.py — 现代化暗黑胶囊多模态对话弹窗。
 
-功能矩阵（四合一）：
+功能矩阵：
 1. 文字输入：自适应多行输入，回车即发，Shift+Enter 换行，Esc 退出
-2. 图片上传：点击 🖼️ 或 Ctrl+V 直接粘贴剪贴板图片，自动生成 Base64 附件卡片与移除按钮
-3. 屏幕截图：点击 📷 毫秒级抓取屏幕全景画面，挂载为待发送附件
-4. 语音录音：点击 🎙️ 支持快速语音录制输入
-5. 外形美学：纯粹暗黑亚克力磨砂背景 + 2px 极光白高亮圆角描边 + 底部小三角指示尾巴
+2. 目标桌宠指示与一键切换：清晰显示并可切换当前发送目标（🐟 大肥鱼 / 👧 蓝毛女仆）
+3. 图片上传：点击 🖼️ 或 Ctrl+V 直接粘贴剪贴板图片，自动智能缩放压缩以符合 DSH 附件协议 (attachment.data)
+4. 屏幕截图：点击 📷 抓取屏幕画面，自动压缩并挂载为待发送附件
+5. 语音唤醒：点击 🎙️ 触发对应桌宠原生语音录入热键（大肥鱼 Alt×2 / 小女仆 Ctrl+Shift+M）
 """
 from __future__ import annotations
 
@@ -14,11 +14,11 @@ import base64
 import logging
 
 from PySide6.QtCore import (
-    Qt, Signal, QPoint, QRectF, QByteArray, QBuffer, QIODevice, QTimer, QEvent
+    Qt, Signal, QRectF, QByteArray, QBuffer, QIODevice, QTimer, QEvent
 )
 from PySide6.QtGui import (
     QColor, QFont, QPainter, QPainterPath, QPen, QBrush,
-    QKeyEvent, QPixmap, QImage
+    QKeyEvent, QPixmap
 )
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QVBoxLayout, QWidget,
@@ -28,14 +28,18 @@ from PySide6.QtWidgets import (
 
 log = logging.getLogger('dsh.chat')
 
+# DSH 宿主 parseImageAttachment 的 base64 长度上限为 900,000 字符
+_MAX_B64_CHARS = 820_000
+
 
 class ChatDialog(QDialog):
-    """1:1 复刻桌宠原生暗黑胶囊打字框与多模态输入组件。"""
+    """桌宠暗黑胶囊打字框与多模态输入组件。"""
 
     # 发射 (text: str, attachment: dict | None)
     chat_submitted = Signal(str, object)
-    # 兼容原有旧信号
     message_sent = Signal(str)
+    voice_triggered = Signal(str)
+    target_switched = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -48,21 +52,66 @@ class ChatDialog(QDialog):
 
         self._is_expanded = False
         self._font_size = 10
-        self.setFixedSize(460, 100)
+        self._target_pet = 'coopanion'
+        self._cast_mode = 'dual'
+        self.setFixedSize(480, 104)
 
         self._tail_offset_x = 0
         self._attachment: dict | None = None
         self._attachment_pixmap: QPixmap | None = None
-        self._is_recording = False
 
         self._build_ui()
+
+    def set_target_info(self, cast_mode: str, target_pet: str):
+        """同步当前投放模式与对话目标桌宠。"""
+        self._cast_mode = cast_mode
+        self._target_pet = target_pet if cast_mode == 'dual' else cast_mode
+        self._refresh_target_badge()
+
+    def _refresh_target_badge(self):
+        is_coop = (self._target_pet == 'coopanion')
+        if is_coop:
+            self._btn_target.setText("🐟 致: 大肥鱼")
+            self._btn_target.setStyleSheet("""
+                QPushButton {
+                    background: rgba(111, 227, 255, 0.14);
+                    border: 1px solid rgba(111, 227, 255, 0.45);
+                    border-radius: 8px;
+                    color: #6FE3FF;
+                    padding: 0 9px;
+                    font-weight: bold;
+                }
+                QPushButton:hover { background: rgba(111, 227, 255, 0.25); }
+            """)
+            self._edit.setPlaceholderText("和大肥鱼说点什么…")
+        else:
+            self._btn_target.setText("👧 致: 蓝毛女仆")
+            self._btn_target.setStyleSheet("""
+                QPushButton {
+                    background: rgba(96, 165, 250, 0.16);
+                    border: 1px solid rgba(96, 165, 250, 0.48);
+                    border-radius: 8px;
+                    color: #93C5FD;
+                    padding: 0 9px;
+                    font-weight: bold;
+                }
+                QPushButton:hover { background: rgba(96, 165, 250, 0.28); }
+            """)
+            self._edit.setPlaceholderText("和蓝毛小女仆聊聊天（支持粘贴/上传图片）…")
+        self._btn_target.setToolTip("点击切换对话目标桌宠" if self._cast_mode == 'dual' else "当前单宠投放目标")
+
+    def _on_target_clicked(self):
+        if self._cast_mode == 'dual':
+            self._target_pet = 'dsh' if self._target_pet == 'coopanion' else 'coopanion'
+            self._refresh_target_badge()
+            self.target_switched.emit(self._target_pet)
 
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 16)
         root.setSpacing(6)
 
-        # 1. 顶部行：打字输入框 + 发送按钮 + 关闭按钮
+        # 1. 顶部行：打字输入框 + 发送按钮 + 放大/关闭按钮
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
 
@@ -72,9 +121,9 @@ class ChatDialog(QDialog):
         self._edit.setFixedHeight(48)
         self._edit.setStyleSheet("""
             QTextEdit {
-                background: rgba(13, 17, 24, 0.90);
-                border: 1.5px solid #2F73F6;
-                border-radius: 14px;
+                background: rgba(13, 17, 24, 0.92);
+                border: 1.5px solid rgba(111, 227, 255, 0.55);
+                border-radius: 13px;
                 color: #FFFFFF;
                 padding: 6px 10px;
                 selection-background-color: #2F73F6;
@@ -88,19 +137,18 @@ class ChatDialog(QDialog):
         top_row.addWidget(self._edit, 1)
 
         self._btn_send = QPushButton("发送")
-        self._btn_send.setFixedSize(68, 48)
+        self._btn_send.setFixedSize(64, 48)
         self._btn_send.setCursor(Qt.PointingHandCursor)
         self._btn_send.setFont(QFont("Microsoft YaHei UI", 10, QFont.Bold))
         self._btn_send.setStyleSheet("""
             QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #FFFFFF, stop:1 #E2E8F0);
+                background: #6FE3FF;
                 border: none;
-                border-radius: 14px;
-                color: #0F172A;
+                border-radius: 13px;
+                color: #090D16;
             }
             QPushButton:hover {
-                background: #6FE3FF;
-                color: #090D16;
+                background: #9AEEFF;
             }
             QPushButton:pressed {
                 background: #38BDF8;
@@ -117,14 +165,14 @@ class ChatDialog(QDialog):
             QPushButton {
                 background: transparent;
                 border: none;
-                color: rgba(255, 255, 255, 0.45);
+                color: rgba(255, 255, 255, 0.55);
                 font-size: 13px;
                 font-weight: bold;
                 border-radius: 12px;
             }
             QPushButton:hover {
                 color: #6FE3FF;
-                background: rgba(255, 255, 255, 0.15);
+                background: rgba(255, 255, 255, 0.12);
             }
         """)
         self._btn_expand.clicked.connect(self._toggle_expand)
@@ -137,14 +185,14 @@ class ChatDialog(QDialog):
             QPushButton {
                 background: transparent;
                 border: none;
-                color: rgba(255, 255, 255, 0.45);
+                color: rgba(255, 255, 255, 0.55);
                 font-size: 13px;
                 font-weight: bold;
                 border-radius: 12px;
             }
             QPushButton:hover {
-                color: #FFFFFF;
-                background: rgba(255, 255, 255, 0.15);
+                color: #FF5B5B;
+                background: rgba(255, 91, 91, 0.15);
             }
         """)
         btn_close.clicked.connect(self.reject)
@@ -152,30 +200,34 @@ class ChatDialog(QDialog):
 
         root.addLayout(top_row)
 
-        # 2. 底部工具栏行：图片上传、截屏、语音输入、附件预览卡片
+        # 2. 底部工具栏行：目标桌宠徽标、图片上传、截屏、语音输入、附件预览卡片
         bottom_row = QHBoxLayout()
-        bottom_row.setContentsMargins(4, 0, 4, 0)
-        bottom_row.setSpacing(10)
+        bottom_row.setContentsMargins(2, 0, 2, 0)
+        bottom_row.setSpacing(6)
 
-        # 图片上传按钮
+        self._btn_target = QPushButton("🐟 致: 大肥鱼")
+        self._btn_target.setFixedHeight(26)
+        self._btn_target.setFont(QFont("Microsoft YaHei UI", 9))
+        self._btn_target.setCursor(Qt.PointingHandCursor)
+        self._btn_target.clicked.connect(self._on_target_clicked)
+        bottom_row.addWidget(self._btn_target)
+
         self._btn_image = QPushButton("🖼️ 图片")
-        self._btn_image.setToolTip("选择本地图片或从剪贴板粘贴 (Ctrl+V)")
+        self._btn_image.setToolTip("选择本地图片或粘贴剪贴板图片 (Ctrl+V)")
         self._btn_image.setCursor(Qt.PointingHandCursor)
         self._style_sub_button(self._btn_image)
         self._btn_image.clicked.connect(self._pick_image)
         bottom_row.addWidget(self._btn_image)
 
-        # 截屏按钮
         self._btn_screen = QPushButton("📷 截屏")
-        self._btn_screen.setToolTip("截取当前屏幕画面作为对话输入")
+        self._btn_screen.setToolTip("截取当前屏幕画面作为多模态附图")
         self._btn_screen.setCursor(Qt.PointingHandCursor)
         self._style_sub_button(self._btn_screen)
         self._btn_screen.clicked.connect(self._capture_screen)
         bottom_row.addWidget(self._btn_screen)
 
-        # 语音输入按钮
         self._btn_voice = QPushButton("🎙️ 语音")
-        self._btn_voice.setToolTip("开启/关闭语音录入")
+        self._btn_voice.setToolTip("触发当前桌宠原生语音热键")
         self._btn_voice.setCursor(Qt.PointingHandCursor)
         self._style_sub_button(self._btn_voice)
         self._btn_voice.clicked.connect(self._toggle_voice)
@@ -185,40 +237,38 @@ class ChatDialog(QDialog):
         self._attach_container = QWidget()
         self._attach_container.setVisible(False)
         attach_layout = QHBoxLayout(self._attach_container)
-        attach_layout.setContentsMargins(6, 2, 6, 2)
-        attach_layout.setSpacing(6)
+        attach_layout.setContentsMargins(6, 1, 6, 1)
+        attach_layout.setSpacing(5)
         self._attach_container.setStyleSheet("""
             QWidget {
-                background: rgba(47, 115, 246, 0.20);
+                background: rgba(47, 115, 246, 0.22);
                 border: 1px solid rgba(111, 227, 255, 0.45);
-                border-radius: 8px;
+                border-radius: 7px;
             }
         """)
 
         self._attach_thumb = QLabel()
-        self._attach_thumb.setFixedSize(26, 26)
+        self._attach_thumb.setFixedSize(22, 22)
         self._attach_thumb.setScaledContents(True)
         attach_layout.addWidget(self._attach_thumb)
 
-        self._attach_label = QLabel("已附加图片")
-        self._attach_label.setFont(QFont("Microsoft YaHei UI", 9))
+        self._attach_label = QLabel("已附图")
+        self._attach_label.setFont(QFont("Microsoft YaHei UI", 8))
         self._attach_label.setStyleSheet("color: #6FE3FF; border: none; background: transparent;")
         attach_layout.addWidget(self._attach_label)
 
         btn_remove_attach = QPushButton("✕")
-        btn_remove_attach.setFixedSize(18, 18)
+        btn_remove_attach.setFixedSize(16, 16)
         btn_remove_attach.setCursor(Qt.PointingHandCursor)
         btn_remove_attach.setStyleSheet("""
             QPushButton {
                 background: rgba(255, 255, 255, 0.2);
                 border: none;
                 color: #FFFFFF;
-                font-size: 11px;
-                border-radius: 9px;
+                font-size: 10px;
+                border-radius: 8px;
             }
-            QPushButton:hover {
-                background: #EF4444;
-            }
+            QPushButton:hover { background: #EF4444; }
         """)
         btn_remove_attach.clicked.connect(self._clear_attachment)
         attach_layout.addWidget(btn_remove_attach)
@@ -226,27 +276,27 @@ class ChatDialog(QDialog):
         bottom_row.addWidget(self._attach_container)
         bottom_row.addStretch(1)
 
-        # 状态提示微字
-        self._hint_label = QLabel("回车发送 · Shift+回车换行")
+        self._hint_label = QLabel("Enter 发送 · Shift+Enter 换行")
         self._hint_label.setFont(QFont("Microsoft YaHei UI", 8))
         self._hint_label.setStyleSheet("color: rgba(255, 255, 255, 0.38);")
         bottom_row.addWidget(self._hint_label)
 
         root.addLayout(bottom_row)
+        self._refresh_target_badge()
 
     def _style_sub_button(self, btn: QPushButton):
-        btn.setFixedHeight(28)
+        btn.setFixedHeight(26)
         btn.setFont(QFont("Microsoft YaHei UI", 9))
         btn.setStyleSheet("""
             QPushButton {
-                background: rgba(255, 255, 255, 0.08);
-                border: 1px solid rgba(255, 255, 255, 0.16);
+                background: rgba(255, 255, 255, 0.07);
+                border: 1px solid rgba(255, 255, 255, 0.14);
                 border-radius: 8px;
                 color: #CBD5E1;
-                padding: 0 10px;
+                padding: 0 8px;
             }
             QPushButton:hover {
-                background: rgba(255, 255, 255, 0.18);
+                background: rgba(255, 255, 255, 0.16);
                 color: #FFFFFF;
                 border-color: #6FE3FF;
             }
@@ -256,22 +306,45 @@ class ChatDialog(QDialog):
         """)
 
     def _set_attachment_pixmap(self, pix: QPixmap, media_type: str = "image/png"):
+        """编码并自适应压缩图片，确保严格满足 dsh-pet parseImageAttachment 的 data 字段与 900KB Base64 限制。"""
+        work_pix = pix
+        if work_pix.width() > 1280 or work_pix.height() > 960:
+            work_pix = work_pix.scaled(1280, 960, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
         ba = QByteArray()
         buf = QBuffer(ba)
         buf.open(QIODevice.WriteOnly)
-        pix.save(buf, "PNG" if "png" in media_type else "JPEG", 85)
-        raw_bytes = ba.data().data()
+        fmt = "PNG" if "png" in media_type else "JPEG"
+        work_pix.save(buf, fmt, 85)
+        raw_bytes = bytes(ba.data())
+        b64 = base64.b64encode(raw_bytes).decode('ascii')
 
-        b64 = base64.b64encode(raw_bytes).decode('utf-8')
+        # 若 PNG base64 超过上限，自动转为高画质 JPEG 并按需降尺寸
+        if len(b64) > _MAX_B64_CHARS:
+            media_type = "image/jpeg"
+            for quality, max_w in ((82, 1280), (75, 1024), (68, 800)):
+                if work_pix.width() > max_w:
+                    work_pix = work_pix.scaled(max_w, int(max_w * 0.75), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                ba.clear()
+                buf = QBuffer(ba)
+                buf.open(QIODevice.WriteOnly)
+                work_pix.save(buf, "JPEG", quality)
+                raw_bytes = bytes(ba.data())
+                b64 = base64.b64encode(raw_bytes).decode('ascii')
+                if len(b64) <= _MAX_B64_CHARS:
+                    break
+
         self._attachment = {
+            'data': b64,
             'base64': b64,
             'mediaType': media_type,
             'bytes': len(raw_bytes),
-            'width': pix.width(),
-            'height': pix.height()
+            'width': work_pix.width(),
+            'height': work_pix.height()
         }
-        self._attachment_pixmap = pix
-        self._attach_thumb.setPixmap(pix)
+        self._attachment_pixmap = work_pix
+        self._attach_thumb.setPixmap(work_pix)
+        self._attach_label.setText(f"{len(raw_bytes) / 1024:.0f}KB")
         self._attach_container.setVisible(True)
 
     def _clear_attachment(self):
@@ -292,39 +365,38 @@ class ChatDialog(QDialog):
     def _capture_screen(self):
         """截取当前屏幕画面并附加"""
         self.hide()
-        QTimer.singleShot(220, self._finish_capture)
+        QTimer.singleShot(200, self._finish_capture)
 
     def _finish_capture(self):
         screen = QApplication.primaryScreen()
         if screen:
             pix = screen.grabWindow(0)
             if not pix.isNull():
-                self._set_attachment_pixmap(pix, "image/png")
+                self._set_attachment_pixmap(pix, "image/jpeg")
         self.show()
         self.raise_()
         self.activateWindow()
         self._edit.setFocus()
 
     def _toggle_voice(self):
-        """语音输入交互反馈"""
-        if not self._is_recording:
-            self._is_recording = True
-            self._btn_voice.setText("🔴 录音中...")
-            self._btn_voice.setStyleSheet("background: #EF4444; color: #FFF; border-radius: 8px;")
-            self._hint_label.setText("正在听您说话，再次点击完成录音...")
-        else:
-            self._is_recording = False
-            self._btn_voice.setText("🎙️ 语音")
-            self._style_sub_button(self._btn_voice)
-            self._hint_label.setText("回车发送 · Shift+回车换行")
-            cur = self._edit.toPlainText().strip()
-            if not cur:
-                self._edit.setPlainText("大肥鱼，你今天做了什么呀？")
+        """触发对应桌宠的真实全局语音热键。"""
+        try:
+            from core.win32_guard import trigger_coopanion_voice, trigger_dsh_voice
+            if self._target_pet == 'coopanion':
+                trigger_coopanion_voice()
+                self._hint_label.setText("🎙️ 已唤醒大肥鱼语音 (Alt×2)")
+            else:
+                trigger_dsh_voice()
+                self._hint_label.setText("🎙️ 已切换女仆语音录音 (Ctrl+Shift+M)")
+        except Exception as e:
+            log.warning('触发语音热键异常: %s', e)
+        self.voice_triggered.emit(self._target_pet)
 
     def _toggle_expand(self):
         """切换紧凑胶囊模式与放大输入模式"""
         self._is_expanded = not self._is_expanded
-        screen = QApplication.primaryScreen().availableGeometry()
+        sc = QApplication.screenAt(self.geometry().center())
+        screen = sc.availableGeometry() if sc else QApplication.primaryScreen().availableGeometry()
 
         if self._is_expanded:
             self._btn_expand.setText("🗗")
@@ -332,14 +404,14 @@ class ChatDialog(QDialog):
             new_w, new_h = 660, 240
             self._edit.setFixedHeight(150)
             self._btn_send.setFixedHeight(150)
-            self._hint_label.setText("回车发送 · Shift+回车换行 · 🗗 紧凑")
+            self._hint_label.setText("Enter 发送 · Shift+Enter 换行 · F11 紧凑")
         else:
             self._btn_expand.setText("⛶")
             self._btn_expand.setToolTip("放大对话框 (F11)")
-            new_w, new_h = 460, 100
+            new_w, new_h = 480, 104
             self._edit.setFixedHeight(48)
             self._btn_send.setFixedHeight(48)
-            self._hint_label.setText("回车发送 · Shift+回车换行 · ⛶ 放大")
+            self._hint_label.setText("Enter 发送 · Shift+Enter 换行")
 
         cur = self.geometry()
         new_x = cur.center().x() - new_w // 2
@@ -352,7 +424,6 @@ class ChatDialog(QDialog):
         self.update()
 
     def eventFilter(self, obj, event):
-        """拦截打字框快捷键：Enter 发送，Shift+Enter 换行，Ctrl+V 粘贴图片，F11 放大/还原，Ctrl+滚轮缩放字体"""
         if event.type() == QEvent.KeyPress:
             key_event: QKeyEvent = event
             if key_event.key() == Qt.Key_F11:
@@ -363,12 +434,11 @@ class ChatDialog(QDialog):
             key_event: QKeyEvent = event
             if key_event.key() in (Qt.Key_Return, Qt.Key_Enter):
                 if key_event.modifiers() & Qt.ShiftModifier:
-                    return False  # 允许换行
+                    return False
                 else:
                     self._do_send()
-                    return True  # 拦截发送
+                    return True
             elif key_event.key() == Qt.Key_V and key_event.modifiers() & Qt.ControlModifier:
-                # 检查剪贴板是否含图片
                 clipboard = QApplication.clipboard()
                 mime = clipboard.mimeData()
                 if mime.hasImage():
@@ -413,9 +483,14 @@ class ChatDialog(QDialog):
 
     def popup_at(self, anchor_widget=None):
         """弹出输入气泡，智能对齐"""
-        screen = QApplication.primaryScreen().availableGeometry()
-        w = 660 if self._is_expanded else 460
-        h = 240 if self._is_expanded else 100
+        if anchor_widget and anchor_widget.isVisible():
+            sc = QApplication.screenAt(anchor_widget.geometry().center())
+            screen = sc.availableGeometry() if sc else QApplication.primaryScreen().availableGeometry()
+        else:
+            screen = QApplication.primaryScreen().availableGeometry()
+
+        w = 660 if self._is_expanded else 480
+        h = 240 if self._is_expanded else 104
         self.setFixedSize(w, h)
 
         if anchor_widget and anchor_widget.isVisible():
@@ -442,7 +517,6 @@ class ChatDialog(QDialog):
         self.update()
 
     def paintEvent(self, event):
-        """自绘极暗黑背景 + 2px 极光白圆角高亮描边 + 底部小三角指示尾巴"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -474,7 +548,7 @@ class ChatDialog(QDialog):
 
         painter.fillPath(path, QBrush(QColor(18, 22, 31, 248)))
 
-        pen = QPen(QColor(255, 255, 255, 245), 2.0)
+        pen = QPen(QColor(111, 227, 255, 190), 1.6)
         pen.setJoinStyle(Qt.RoundJoin)
         pen.setCapStyle(Qt.RoundCap)
         painter.strokePath(path, pen)
