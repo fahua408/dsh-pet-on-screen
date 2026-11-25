@@ -92,18 +92,21 @@ class BallWindow(QWidget):
         self._cast_mode   = getattr(config, 'cast_mode', 'dual') if config else 'dual'
         self._control_target = getattr(config, 'control_target', 'coopanion') if config else 'coopanion'
 
-        # 位置恢复（使用 availableGeometry 避免被任务栏或多屏移出界）
+        # 位置恢复（兼容多显示器，使用所在屏幕的 availableGeometry）
         screen = QApplication.primaryScreen().availableGeometry()
         init_x = screen.right() - BALL_SIZE + 1
         init_y = screen.top() + max(100, screen.height() // 2 - 80)
         if config is not None:
             bx = getattr(config, 'ball_x', -1)
             by = getattr(config, 'ball_y', -1)
-            # 严格确保在可见区内，绝不落入屏幕外
-            if bx >= screen.left() and bx <= screen.right() - BALL_SIZE + 1:
-                init_x = bx
-            if by >= screen.top() and by <= screen.bottom() - BALL_SIZE:
-                init_y = by
+            if bx >= 0 and by >= 0:
+                target_sc = QApplication.screenAt(QPoint(bx, by))
+                if target_sc is not None:
+                    screen = target_sc.availableGeometry()
+                if screen.left() <= bx <= screen.right() - BALL_SIZE + 1:
+                    init_x = bx
+                if screen.top() <= by <= screen.bottom() - BALL_SIZE:
+                    init_y = by
         self.move(init_x, init_y)
 
         # 初始检测是否靠近边缘
@@ -132,11 +135,15 @@ class BallWindow(QWidget):
         self._hover_timer.setInterval(16)
         self._hover_timer.timeout.connect(self._tick_hover)
 
-        # 置顶保持定时器
+        # 置顶保持定时器（仅在菜单未展开且空闲时温和置顶，避免抢夺菜单/弹窗Z序）
         self._raise_timer = QTimer(self)
-        self._raise_timer.setInterval(2000)
-        self._raise_timer.timeout.connect(self.raise_)
+        self._raise_timer.setInterval(3500)
+        self._raise_timer.timeout.connect(self._safe_raise)
         self._raise_timer.start()
+
+    def _safe_raise(self):
+        if self.isVisible() and not self._is_menu_open and not self._dragging:
+            self.raise_()
 
     # ================================================================
     # 极简圆环绘制
@@ -236,7 +243,8 @@ class BallWindow(QWidget):
                     self.drag_started.emit()
             if self._dragging:
                 new_pos = self._drag_start_pos + delta
-                screen = QApplication.primaryScreen().availableGeometry()
+                sc = QApplication.screenAt(event.globalPosition().toPoint())
+                screen = sc.availableGeometry() if sc else self._current_screen()
                 new_pos.setX(max(screen.left(), min(new_pos.x(), screen.right() - BALL_SIZE)))
                 new_pos.setY(max(screen.top(), min(new_pos.y(), screen.bottom() - BALL_SIZE)))
                 self.move(new_pos)
