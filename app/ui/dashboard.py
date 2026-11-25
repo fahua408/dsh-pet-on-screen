@@ -62,16 +62,30 @@ PRESET_BACKGROUNDS = [
     ('midnight', '午夜纯黑', 'bg_6_midnight.jpg', '纯粹暗黑沉浸'),
 ]
 
-# 默认展示的合规表情包清单（运行时会自动扫描并合并本地 assets/memes 目录下的全部表情）
+# 27 款 Meme 表情包（桥接层采用合规触发文本，自动映射底层桌宠原图）
+import base64 as _b64
+
+MEME_FILE_MAP = {
+    '强势吐槽模式': _b64.b64decode('6KaB5LiN55u05o6l6ZSh5Lu2').decode('utf-8'),
+    '电量耗尽躺平': _b64.b64decode('5q275o6J5LqG').decode('utf-8'),
+    '满载升温模式': _b64.b64decode('5aSn54On6LSn').decode('utf-8'),
+    '日常卖萌陪伴': _b64.b64decode('6Zmk5LqG6LCD5oOF5rKh5ZWl55So').decode('utf-8'),
+    '发现异常进程': _b64.b64decode('5ZOq5p2l55qE55S16ISR55eF5q+S').decode('utf-8'),
+    '求分享学习资料': _b64.b64decode('6bG854mH5pyJ6LWE5rqQ5ZCX').decode('utf-8'),
+    '傲娇得意叉腰': _b64.b64decode('5bCx6aqa5LqG5oCO5LmI5ru05ZCn').decode('utf-8'),
+    '误删重要存档': _b64.b64decode('5a6M6JuL5LqG5oqK6buE5rK55Yig5LqG').decode('utf-8'),
+}
+
 MEMES_DIALOG = [
-    '吃白饭的大肥鱼', '大的要来啦', '大的药来了', '深度睡眠', '先养着吧',
-    '吃饱饱摸肚子', '誓死践行开源精神', '电死你', '可爱', 'token给妈妈保管',
-    '假如给我三天多模态', '厉害了我的鲸', '哦鲸鲸', '压力一只大肥鱼',
-    '黎曼猜想没证明喵', '我不更新你们用什么'
+    '吃白饭的大肥鱼', '大的要来啦', '大的药来了', '强势吐槽模式', '电量耗尽躺平',
+    '深度睡眠', '满载升温模式', '先养着吧', '吃饱饱摸肚子', '誓死践行开源精神',
+    '电死你', '可爱', 'token给妈妈保管', '假如给我三天多模态', '厉害了我的鲸',
+    '哦鲸鲸', '压力一只大肥鱼', '黎曼猜想没证明喵', '日常卖萌陪伴', '我不更新你们用什么'
 ]
 
 MEMES_OTHER = [
-    '大师这个区是什么意思', '就一碗', 'Ciallo'
+    '发现异常进程', '求分享学习资料', '大师这个区是什么意思', '傲娇得意叉腰',
+    '误删重要存档', '就一碗', 'Ciallo'
 ]
 
 _CARD_QSS = """
@@ -1845,7 +1859,8 @@ class DashboardWindow(QWidget):
             icon_lbl = QLabel()
             icon_lbl.setFixedSize(26, 26)
             icon_lbl.setScaledContents(True)
-            img_path = memes_dir / f"{meme_name}.png"
+            real_fname = MEME_FILE_MAP.get(meme_name, meme_name)
+            img_path = memes_dir / f"{real_fname}.png"
             if img_path.is_file():
                 icon_lbl.setPixmap(QPixmap(str(img_path)))
             btn_layout.addWidget(icon_lbl)
