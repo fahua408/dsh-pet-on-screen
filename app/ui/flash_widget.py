@@ -381,8 +381,6 @@ class FlashWidget(QWidget):
                 if hasattr(self, '_lbl_wallpaper_info'):
                     self._lbl_wallpaper_info.setText(f"当前应用待机壁纸 · 640×480 ({size_kb:.1f} KB)")
                 try:
-                    defaults_dir = Path(__file__).resolve().parents[1] / "assets/defaults"
-                    shutil.copy2(path, defaults_dir / "current_standby.jpg")
                     appdata_dir = Path(os.environ.get('APPDATA', '')) / 'BigFishTitanConsole'
                     appdata_dir.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(path, appdata_dir / "current_standby.jpg")
