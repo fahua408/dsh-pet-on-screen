@@ -124,14 +124,21 @@ class FlashBridge:
     注意：Flash 读写期间必须关闭 DataPusher（释放 USB 总线）。
     """
 
-    def __init__(self, signals: FlashSignals, pusher: 'DataPusher | None' = None):
+    def __init__(self, signals: FlashSignals | 'DataPusher', pusher: 'DataPusher | FlashSignals | None' = None):
         """
         Args:
-            signals: 信号对象，用于回报进度与完成状态
+            signals: 信号对象，用于回报进度与完成状态（兼容 (signals, pusher) 与 (pusher, signals) 两种传参顺序）
             pusher:  推流线程实例（可选）；若提供，刷写前后自动 pause/resume
         """
-        self.signals = signals
-        self.pusher = pusher
+        if isinstance(signals, FlashSignals):
+            self.signals = signals
+            self.pusher = pusher
+        elif isinstance(pusher, FlashSignals):
+            self.signals = pusher
+            self.pusher = signals
+        else:
+            self.signals = signals  # type: ignore[assignment]
+            self.pusher = pusher
         self._lock = threading.Lock()   # 防止并发刷写
 
     # ---- 公开接口 ----------------------------------------------------
