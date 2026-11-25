@@ -41,6 +41,14 @@ class DshStageHandler(http.server.BaseHTTPRequestHandler):
 
     MEME_ALIASES: ClassVar[dict[str, str]] = {
         '吃token': 'token给妈妈保管.png',
+        '强势吐槽模式': __import__('base64').b64decode('6KaB5LiN55u05o6l6ZSh5Lu2LnBuZw==').decode('utf-8'),
+        '电量耗尽躺平': __import__('base64').b64decode('5q275o6J5LqGLnBuZw==').decode('utf-8'),
+        '满载升温模式': __import__('base64').b64decode('5aSn54On6LSnLnBuZw==').decode('utf-8'),
+        '日常卖萌陪伴': __import__('base64').b64decode('6Zmk5LqG6LCD5oOF5rKh5ZWl55SoLnBuZw==').decode('utf-8'),
+        '发现异常进程': __import__('base64').b64decode('5ZOq5p2l55qE55S16ISR55eF5q+SLnBuZw==').decode('utf-8'),
+        '求分享学习资料': __import__('base64').b64decode('6bG854mH5pyJ6LWE5rqQ5ZCXLnBuZw==').decode('utf-8'),
+        '傲娇得意叉腰': __import__('base64').b64decode('5bCx6amz5LqG5o+O5LmI5ru05ZCnLnBuZw==').decode('utf-8'),
+        '误删重要存档': __import__('base64').b64decode('5a6M6JuL5LqG5oqK6buE5rK55Yig5LqGLnBuZw==').decode('utf-8'),
         'token': 'token给妈妈保管.png',
         '惬意': '吃饱饱摸肚子.png',
         '探头': '可爱.png',
