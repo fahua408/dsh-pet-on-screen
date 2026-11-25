@@ -254,9 +254,9 @@ class BallMenu(QWidget):
         if getattr(self, '_cast_mode', 'dual') == 'dual':
             target = getattr(self, '_control_target', 'coopanion')
             if target == 'coopanion':
-                items.append(('switch_target', '🔄 控制切换: [当前: 大肥鱼 ➔ 切为女仆]'))
+                items.append(('switch_target', '切换控制：当前大肥鱼 ➔ 切为女仆'))
             else:
-                items.append(('switch_target', '🔄 控制切换: [当前: 蓝毛女仆 ➔ 切为肥鱼]'))
+                items.append(('switch_target', '切换控制：当前蓝毛女仆 ➔ 切为肥鱼'))
 
         # 依据当前活跃控制目标填充专属菜单
         active_target = self._control_target if getattr(self, '_cast_mode', 'dual') == 'dual' else self._cast_mode
@@ -325,18 +325,19 @@ class BallMenu(QWidget):
         if not self._last_ball_window:
             return
 
-        screen = QApplication.primaryScreen().geometry()
+        sc = QApplication.screenAt(self._last_ball_window.geometry().center())
+        screen = sc.geometry() if sc else QApplication.primaryScreen().geometry()
         ball_rect = self._last_ball_window.geometry()
 
         ball_cx_g = ball_rect.x() + self._last_ball_window.width() / 2.0
         ball_cy_g = ball_rect.y() + self._last_ball_window.height() / 2.0
 
-        # 留足 140px 边距，确保外侧径向延展的文字气泡不被窗口剪切
-        margin = int(MENU_R + MENU_BTN + 140)
-        win_x = max(0, int(ball_cx_g - margin))
-        win_y = max(0, int(ball_cy_g - margin))
-        win_w = min(screen.width() - win_x, int(margin * 2))
-        win_h = min(screen.height() - win_y, int(margin * 2))
+        # 留足 150px 边距，确保外侧径向延展的文字气泡不被窗口剪切
+        margin = int(MENU_R + MENU_BTN + 150)
+        win_x = max(screen.left(), int(ball_cx_g - margin))
+        win_y = max(screen.top(), int(ball_cy_g - margin))
+        win_w = min(screen.right() - win_x, int(margin * 2))
+        win_h = min(screen.bottom() - win_y, int(margin * 2))
 
         self.setGeometry(win_x, win_y, win_w, win_h)
 
@@ -345,17 +346,19 @@ class BallMenu(QWidget):
 
         # 计算最优扇区角度
         n = max(1, len(self._buttons) - 1)
-        if ball_cx_g >= screen.width() / 2.0:
-            if ball_cy_g > screen.height() - 170:
+        rel_x = ball_cx_g - screen.left()
+        rel_y = ball_cy_g - screen.top()
+        if rel_x >= screen.width() / 2.0:
+            if rel_y > screen.height() - 170:
                 start_angle, span = 165.0, 95.0     # 靠下偏向左上
-            elif ball_cy_g < 170:
+            elif rel_y < 170:
                 start_angle, span = 100.0, 95.0     # 靠上偏向左下
             else:
                 start_angle, span = 115.0, 130.0    # 对称向左展开 (跨度 130°)
         else:
-            if ball_cy_g > screen.height() - 170:
+            if rel_y > screen.height() - 170:
                 start_angle, span = 280.0, 95.0     # 靠下偏向右上
-            elif ball_cy_g < 170:
+            elif rel_y < 170:
                 start_angle, span = -10.0, 95.0     # 靠上偏向右下
             else:
                 start_angle, span = -65.0, 130.0    # 对称向右展开
@@ -624,13 +627,17 @@ class BallMenu(QWidget):
             htw = fm.horizontalAdvance(hud_tip) + 14
             hth = 20
 
-            # 居中放置在扇面顶端空位
-            htx = int(self._ball_cx - MENU_R * 0.75 - htw / 2.0)
-            hty = int(self._ball_cy - MENU_R - 16)
-            painter.setBrush(QBrush(QColor(15, 23, 42, 220)))
-            painter.setPen(QPen(QColor(111, 227, 255, 140), 1))
-            painter.drawRoundedRect(QRectF(htx, hty, htw, hth), 5, 5)
-            painter.setPen(QColor(111, 227, 255, 230))
+            # 根据扇区展开方向自动对齐放置在扇面顶端，避免左贴边时被裁切
+            mid_rad = math.radians(self._start_angle + self._span / 2.0)
+            dir_x = math.cos(mid_rad)
+            raw_htx = int(self._ball_cx + dir_x * (MENU_R * 0.72) - htw / 2.0)
+            htx = max(8, min(self.width() - htw - 8, raw_htx))
+            hty = max(8, int(self._ball_cy - MENU_R - 22))
+            self._hud_rect = QRect(htx, hty, htw, hth)
+            painter.setBrush(QBrush(QColor(15, 23, 42, 228)))
+            painter.setPen(QPen(QColor(111, 227, 255, 150), 1))
+            painter.drawRoundedRect(QRectF(htx, hty, htw, hth), 6, 6)
+            painter.setPen(QColor(111, 227, 255, 235))
             painter.drawText(QRectF(htx, hty, htw, hth), Qt.AlignCenter, hud_tip)
             painter.restore()
 
@@ -761,17 +768,34 @@ class BallMenu(QWidget):
         return -1
 
     def _update_mask(self):
-        """应用掩码：包含所有按钮圆盘 + 外侧径向 Tooltip 浮条，周围区域 100% 透传桌面"""
+        """应用掩码：包含所有按钮圆盘 + 旋转轨道 + 外侧径向 Tooltip 浮条，防止滚轮掉入按钮缝隙"""
         if not self._is_open:
             self.clearMask()
             return
         region = QRegion()
-        r = int(MENU_BTN / 2.0) + 4
+        r = int(MENU_BTN / 2.0) + 6
         for btn in self._buttons:
             region = region.united(
                 QRegion(int(btn.target_cx - r), int(btn.target_cy - r), r * 2, r * 2, QRegion.Ellipse)
             )
             if btn.hovered:
                 tx, ty, tw, th, _, _ = self._calc_tooltip_rect(btn)
-                region = region.united(QRegion(tx - 3, ty - 3, tw + 6, th + 6))
+                region = region.united(QRegion(tx - 4, ty - 4, tw + 8, th + 8))
+
+        # 在三级动作转盘下，将扇形弧线上的间隙也纳入 mask，确保光标在任意按钮间隙滚动滚轮均不失效
+        if self._menu_level == 'actions_list' and len(self._buttons) >= 2:
+            steps = 24
+            band_r = int(MENU_BTN / 2.0) + 10
+            for s in range(steps + 1):
+                deg = self._start_angle + (self._span * s / steps)
+                rad = math.radians(deg)
+                px = int(self._ball_cx + MENU_R * math.cos(rad))
+                py = int(self._ball_cy + MENU_R * math.sin(rad))
+                region = region.united(
+                    QRegion(px - band_r, py - band_r, band_r * 2, band_r * 2, QRegion.Ellipse)
+                )
+            hud_r = getattr(self, '_hud_rect', None)
+            if hud_r is not None:
+                region = region.united(QRegion(hud_r.adjusted(-4, -4, 4, 4)))
+
         self.setMask(region)
