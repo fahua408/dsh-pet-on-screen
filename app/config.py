@@ -62,26 +62,23 @@ class AppConfig:
 def load_config(path: Path | None = None) -> AppConfig:
     p = Path(path) if path else CONFIG_PATH
     if not p.is_file():
-        # 兼容旧版配置迁移
-        old_p = p.parent.parent / 'DshPetConsole' / 'config.json'
-        if old_p.is_file():
-            try:
-                raw = json.loads(old_p.read_text(encoding='utf-8'))
-                known = {f.name for f in AppConfig.__dataclass_fields__.values()}
-                filtered = {k: v for k, v in raw.items() if k in known}
-                log.info('已从旧版 DshPetConsole 迁移配置: %s', old_p)
-                cfg = AppConfig(**filtered)
-                save_config(cfg, p)
-                return cfg
-            except Exception as e:
-                log.warning('迁移旧版配置失败: %s', e)
         log.info('配置文件不存在，使用默认配置: %s', p)
         return AppConfig()
     try:
         raw = json.loads(p.read_text(encoding='utf-8'))
         known = {f.name for f in AppConfig.__dataclass_fields__.values()}
         filtered = {k: v for k, v in raw.items() if k in known}
-        return AppConfig(**filtered)
+        cfg = AppConfig(**filtered)
+        # 修复非法状态：如果cast_mode不在预期集合内，自动归正
+        if cfg.cast_mode not in ('coopanion', 'dsh', 'dual'):
+            cfg.cast_mode = 'dual'
+        if cfg.cast_mode == 'coopanion':
+            cfg.cast_coopanion, cfg.cast_dsh = True, False
+        elif cfg.cast_mode == 'dsh':
+            cfg.cast_coopanion, cfg.cast_dsh = False, True
+        else:
+            cfg.cast_coopanion, cfg.cast_dsh = True, True
+        return cfg
     except Exception as e:
         log.warning('读取配置失败，使用默认配置: %s — %s', p, e)
         return AppConfig()
@@ -91,7 +88,9 @@ def save_config(cfg: AppConfig, path: Path | None = None):
     p = Path(path) if path else CONFIG_PATH
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(asdict(cfg), ensure_ascii=False, indent=2), encoding='utf-8')
+        tmp_p = p.with_suffix('.json.tmp')
+        tmp_p.write_text(json.dumps(asdict(cfg), ensure_ascii=False, indent=2), encoding='utf-8')
+        tmp_p.replace(p)
     except Exception as e:
         log.error('保存配置失败: %s — %s', p, e)
 
@@ -108,7 +107,7 @@ class SettingsSnapshot(dict):
 
 @dataclass
 class Settings:
-    """线程间共享运行时设置。"""
+    """线程间共享运行时设置（支持防抖异步落盘，避免滑块高频拖拽阻塞 UI）。"""
     cast_mode: str = 'dual'
     cast_coopanion: bool = True
     cast_dsh: bool = True
@@ -128,9 +127,13 @@ class Settings:
     hide_desktop_pet: bool = True
     ball_snap: bool = True
     ball_peek: bool = True
+    autostart: bool = False
+    close_to_tray: bool = True
 
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _version: int = field(default=0, init=False, repr=False)
+    _save_timer: threading.Timer | None = field(default=None, init=False, repr=False)
+    _cfg: AppConfig | None = field(default=None, init=False, repr=False)
 
     def snapshot(self) -> SettingsSnapshot:
         with self._lock:
@@ -151,24 +154,40 @@ class Settings:
                 'hide_desktop_pet': self.hide_desktop_pet,
                 'ball_snap': self.ball_snap,
                 'ball_peek': self.ball_peek,
+                'autostart': self.autostart,
+                'close_to_tray': self.close_to_tray,
                 'version': self._version
             })
 
     def update(self, **kwargs) -> int:
         with self._lock:
+            if self._cfg is None:
+                self._cfg = load_config()
             for k, v in kwargs.items():
                 if hasattr(self, k) and not k.startswith('_'):
                     setattr(self, k, v)
+                if hasattr(self._cfg, k):
+                    setattr(self._cfg, k, v)
             self._version += 1
             ver = self._version
 
-        # 同步写入磁盘
-        cfg = load_config()
-        for k, v in kwargs.items():
-            if hasattr(cfg, k):
-                setattr(cfg, k, v)
-        save_config(cfg)
+            if self._save_timer is not None:
+                self._save_timer.cancel()
+            self._save_timer = threading.Timer(0.25, self.flush)
+            self._save_timer.daemon = True
+            self._save_timer.start()
         return ver
+
+    def flush(self):
+        """立即将内存中的最新配置写入磁盘。"""
+        with self._lock:
+            if self._save_timer is not None:
+                self._save_timer.cancel()
+                self._save_timer = None
+            if self._cfg is None:
+                return
+            cfg_copy = AppConfig(**asdict(self._cfg))
+        save_config(cfg_copy)
 
 
 _GLOBAL_SETTINGS: Settings | None = None
@@ -178,7 +197,7 @@ def get_settings() -> Settings:
     global _GLOBAL_SETTINGS
     if _GLOBAL_SETTINGS is None:
         cfg = load_config()
-        _GLOBAL_SETTINGS = Settings(
+        s = Settings(
             cast_mode=getattr(cfg, 'cast_mode', 'dual'),
             cast_coopanion=getattr(cfg, 'cast_coopanion', True),
             cast_dsh=getattr(cfg, 'cast_dsh', True),
@@ -195,6 +214,10 @@ def get_settings() -> Settings:
             pushing=cfg.pushing,
             hide_desktop_pet=cfg.hide_desktop_pet,
             ball_snap=getattr(cfg, 'ball_snap', True),
-            ball_peek=getattr(cfg, 'ball_peek', True)
+            ball_peek=getattr(cfg, 'ball_peek', True),
+            autostart=getattr(cfg, 'autostart', False),
+            close_to_tray=getattr(cfg, 'close_to_tray', True),
         )
+        s._cfg = cfg
+        _GLOBAL_SETTINGS = s
     return _GLOBAL_SETTINGS
