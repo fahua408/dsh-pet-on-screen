@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 r"""main.py — 大肥鱼桌宠钛坦屏投放工具主控制器
-主入口：初始化 Qt Application，装配多桌宠投放调度中心、Playwright 舞台渲染与 HID 推流引擎，装配自适应悬浮球与控制面板。
-
-用法（开发阶段）：
-    python E:\big_fish\screen\tcomas\unified_work\app\main.py
+主入口：初始化 Qt Application，装配多桌宠投放调度中心、Playwright 舞台渲染与 HID 推流引擎，装配自适应悬浮球与控制中心。
 """
 from __future__ import annotations
 
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import threading
@@ -30,7 +28,7 @@ if hasattr(sys, '_MEIPASS'):
         os.environ['PATH'] = str(_internal_bin) + os.pathsep + os.environ.get('PATH', '')
 
 # ---- 核心配置与底层模块 ----
-from config import AppConfig, Settings, load_config, save_config, get_settings
+from config import load_config, get_settings
 from core.device import DeviceLock
 from core.pusher import DataPusher, PusherSignals
 from core.dsh_client import DshClient, DshSignals
@@ -40,16 +38,12 @@ from core.win32_guard import (
     sync_desktop_pets,
     restore_all_desktop_pets,
     trigger_coopanion_voice,
-    trigger_dsh_chat,
-    trigger_dsh_voice,
-    trigger_dsh_sleep,
     touch_desktop_pet
 )
 
 # ---- UI 模块 ----
 from ui.ball import BallWindow
 from ui.ball_menu import BallMenu
-from ui.panel import PanelWindow
 from ui.dashboard import DashboardWindow
 from ui.chat_dialog import ChatDialog
 
@@ -61,7 +55,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
     handlers=[
-        logging.FileHandler(str(_LOG_FILE), encoding='utf-8', mode='a'),
+        RotatingFileHandler(str(_LOG_FILE), maxBytes=1_500_000, backupCount=2, encoding='utf-8'),
         logging.StreamHandler(sys.stdout) if sys.stdout else logging.NullHandler(),
     ],
 )
@@ -98,6 +92,7 @@ class BigFishTitanApp:
         # ---- 持久化配置与共享状态 ----
         self.cfg = load_config()
         self.settings = get_settings()
+        self._is_sleeping = False
 
         # ---- 硬件锁守护 ----
         self.device_lock = DeviceLock()
@@ -115,7 +110,7 @@ class BigFishTitanApp:
         self.dsh_client = DshClient(self.dsh_signals)
 
         self.flash_signals = FlashSignals()
-        self.flash_bridge = FlashBridge(self.pusher, self.flash_signals)
+        self.flash_bridge = FlashBridge(self.flash_signals, self.pusher)
 
         # ---- UI 表现层 ----
         self.ball = BallWindow(config=self.cfg)
@@ -125,20 +120,16 @@ class BigFishTitanApp:
             settings=self.settings,
             renderer=self.renderer,
             pusher=self.pusher,
-            flash_bridge=self.flash_bridge
+            flash_bridge=self.flash_bridge,
+            dsh_client=self.dsh_client,
         )
-        self.panel = PanelWindow(
-            settings=self.settings,
-            renderer=self.renderer,
-            flash_bridge=self.flash_bridge
-        )
-        self.panel.open_dashboard_requested.connect(self._show_dashboard)
 
         # 初始同步桌宠模式与控制目标
         cast_mode = getattr(self.settings, 'cast_mode', 'dual')
         control_target = getattr(self.settings, 'control_target', 'coopanion')
         self.ball.set_pet_mode(cast_mode, control_target)
         self.menu.set_pet_mode(cast_mode, control_target)
+        self.chat_dialog.set_target_info(cast_mode, control_target)
 
         # ---- 托盘图标 ----
         self._init_tray()
@@ -149,7 +140,7 @@ class BigFishTitanApp:
         # ---- 桌面端互斥定时看门狗 ----
         self._pet_visible_timer = QtCore.QTimer()
         self._pet_visible_timer.timeout.connect(self._sync_desktop_pet_visibility)
-        self._pet_visible_timer.start(2000)
+        self._pet_visible_timer.start(2500)
 
     def _resolve_icon(self) -> QtGui.QIcon:
         ico_path = _APP_DIR / 'assets' / 'app_icon.ico'
@@ -177,7 +168,7 @@ class BigFishTitanApp:
         act_weather = menu.addAction('⛅ 查询实时环境与天气')
         act_weather.triggered.connect(self._on_action_weather)
 
-        act_whisper = menu.addAction('💬 触发大肥鱼碎碎念')
+        act_whisper = menu.addAction('💬 触发碎碎念')
         act_whisper.triggered.connect(self._on_action_whisper)
 
         menu.addSeparator()
@@ -205,6 +196,7 @@ class BigFishTitanApp:
 
         # 2. 对话框输入投递 (文字及多模态附件)
         self.chat_dialog.chat_submitted.connect(self._on_chat_submitted)
+        self.chat_dialog.target_switched.connect(self._on_menu_control_target_changed)
 
         # 3. 控制中心交互与画面微调信号绑定
         self.dashboard.chat_requested.connect(self._open_chat_dialog)
@@ -226,8 +218,6 @@ class BigFishTitanApp:
         self.dashboard.hide_pet_toggled.connect(self._on_toggle_display_mode)
         self.dashboard.ball_snap_toggled.connect(self.ball.set_snap_enabled)
         self.dashboard.ball_peek_toggled.connect(self.ball.set_peek_enabled)
-        self.panel.stream_toggled.connect(self._on_toggle_display_mode)
-        self.panel.hide_pet_toggled.connect(self._on_toggle_display_mode)
 
         # 4. 多桌宠投放调度绑定
         self.dashboard.cast_mode_changed.connect(self._on_cast_mode_changed)
@@ -246,22 +236,17 @@ class BigFishTitanApp:
         self.dsh_signals.balance_changed.connect(
             lambda bal, tier: self.renderer.send_command('balance', balance=bal, tier=tier)
         )
+        self.dsh_signals.sleep_changed.connect(self._on_dsh_sleep_changed)
         self.dsh_signals.env_changed.connect(self._on_env_changed)
 
-        # 6. 渲染预览帧传递给控制中心与微型面板
+        # 6. 渲染预览帧传递给控制中心
         self.renderer_signals.preview_frame_ready.connect(
             self.dashboard.on_frame_ready, QtCore.Qt.QueuedConnection
         )
-        self.renderer_signals.preview_frame_ready.connect(
-            self.panel.on_frame_ready, QtCore.Qt.QueuedConnection
-        )
 
-        # 7. 推流器状态广播给控制中心与微型面板
+        # 7. 推流器状态广播给控制中心
         self.pusher_signals.status_updated.connect(
             self.dashboard.on_status_updated, QtCore.Qt.QueuedConnection
-        )
-        self.pusher_signals.status_updated.connect(
-            self.panel.on_status_updated, QtCore.Qt.QueuedConnection
         )
 
         # 8. Flash 刷写进度
@@ -275,19 +260,21 @@ class BigFishTitanApp:
         # 9. 控制中心背景变更 -> 舞台更新
         self.dashboard.background_changed.connect(self._on_bg_changed)
 
+    def _active_target(self) -> str:
+        mode = getattr(self.settings, 'cast_mode', 'dual')
+        if mode in ('coopanion', 'dsh'):
+            return mode
+        return getattr(self.settings, 'control_target', 'coopanion')
+
     def _on_cast_mode_changed(self, mode: str):
         log.info('切换桌宠投放模式: %s', mode)
         layout = getattr(self.settings, 'dual_layout', 'side_by_side')
         target = getattr(self.settings, 'control_target', 'coopanion')
 
-        # 1. 通知渲染器与 Web 舞台
         self.renderer.send_command('mode_change', mode=mode, layout=layout)
-
-        # 2. 悬浮球自适应当前桌宠主题与按键
         self.ball.set_pet_mode(mode, target)
         self.menu.set_pet_mode(mode, target)
-
-        # 3. 桌面桌宠互斥同步
+        self.chat_dialog.set_target_info(mode, target)
         self._sync_desktop_pet_visibility()
 
     def _on_selective_cast_changed(self, cast_coop: bool, cast_dsh: bool):
@@ -300,16 +287,19 @@ class BigFishTitanApp:
         self.renderer.send_command('mode_change', mode=mode, layout=layout)
 
     def _on_control_target_changed(self, target: str):
-        log.info('控制中心切换悬浮球交互控制靶心: %s', target)
+        log.info('切换悬浮球交互控制目标: %s', target)
         mode = getattr(self.settings, 'cast_mode', 'dual')
         self.ball.set_pet_mode(mode, target)
         self.menu.set_pet_mode(mode, target)
+        self.chat_dialog.set_target_info(mode, target)
 
     def _on_menu_control_target_changed(self, target: str):
-        log.info('悬浮球切换控制目标: %s', target)
+        log.info('悬浮球/对话框切换控制目标: %s', target)
         self.settings.update(control_target=target)
         mode = getattr(self.settings, 'cast_mode', 'dual')
         self.ball.set_pet_mode(mode, target)
+        self.menu.set_pet_mode(mode, target)
+        self.chat_dialog.set_target_info(mode, target)
         self.dashboard.update_control_target_from_ball(target)
 
     def _on_ball_action(self, action: str):
@@ -324,17 +314,21 @@ class BigFishTitanApp:
                 self.menu.show_at(self.ball)
 
     def _open_chat_dialog(self):
+        mode = getattr(self.settings, 'cast_mode', 'dual')
+        target = getattr(self.settings, 'control_target', 'coopanion')
+        self.chat_dialog.set_target_info(mode, target)
         anchor = self.ball if self.ball.isVisible() else self.dashboard
         self.chat_dialog.popup_at(anchor)
 
     def _on_chat_submitted(self, text: str, attachment: dict | None):
-        target = getattr(self.settings, 'control_target', 'coopanion') if getattr(self.settings, 'cast_mode', 'dual') == 'dual' else getattr(self.settings, 'cast_mode', 'coopanion')
-        log.info('发送多模态对话 [目标: %s]: %s', target, text[:20])
+        target = self._active_target()
+        log.info('发送多模态对话 [目标: %s]: %s (附图=%s)', target, text[:20], bool(attachment))
 
         if target == 'coopanion':
             self.renderer.send_command('chat_text', target='coopanion', text=text)
         else:
-            self.renderer.send_command('say', text=text, meme='吃白饭的大肥鱼' if not attachment else '')
+            display_txt = text or '🖼️ [已发送图片，正在思考…]'
+            self.renderer.send_command('say', text=f'💭 {display_txt}', meme='深度思考碎碎念' if attachment else '')
             threading.Thread(target=self.dsh_client.send_chat, args=(text, attachment), daemon=True).start()
 
     def _on_transform_changed(self, scale: float, x: int, y: int):
@@ -345,6 +339,7 @@ class BigFishTitanApp:
 
     def _on_anim_requested(self, anim_name: str):
         log.info('请求播放动作: %s', anim_name)
+        self._is_sleeping = False
         self.renderer.send_command('anim', name=anim_name)
         threading.Thread(target=self.dsh_client.trigger_anim, args=(anim_name,), daemon=True).start()
 
@@ -353,8 +348,12 @@ class BigFishTitanApp:
         self.renderer.send_command('say', text=f'主人看：{meme_name}！', meme=meme_name)
         threading.Thread(target=self.dsh_client.trigger_whisper, kwargs={'meme_name': meme_name}, daemon=True).start()
 
+    def _on_dsh_sleep_changed(self, sleeping: bool):
+        self._is_sleeping = sleeping
+        self.renderer.send_command('sleep', sleep=sleeping)
+
     def _on_pet_action(self, action: str):
-        target = getattr(self.settings, 'control_target', 'coopanion') if getattr(self.settings, 'cast_mode', 'dual') == 'dual' else getattr(self.settings, 'cast_mode', 'coopanion')
+        target = self._active_target()
 
         if action == 'touch':
             self.renderer.send_command('touch', target=target)
@@ -365,15 +364,15 @@ class BigFishTitanApp:
         elif action == 'weather':
             self._on_action_weather()
         elif action == 'todo':
-            trigger_dsh_chat()
+            self._on_action_todo()
         elif action == 'sleep_toggle':
             self._is_sleeping = not getattr(self, '_is_sleeping', False)
-            if self._is_sleeping:
-                self.dsh_client.trigger_sleep()
-                self.renderer.send_command('sleep', sleep=True)
+            target_sleep = self._is_sleeping
+            self.renderer.send_command('sleep', sleep=target_sleep)
+            if target_sleep:
+                threading.Thread(target=self.dsh_client.trigger_sleep, daemon=True).start()
             else:
-                self.dsh_client.trigger_wake()
-                self.renderer.send_command('sleep', sleep=False)
+                threading.Thread(target=self.dsh_client.trigger_wake, daemon=True).start()
         elif action == 'whisper':
             self._on_action_whisper()
 
@@ -381,7 +380,7 @@ class BigFishTitanApp:
         self.menu.hide_menu()
         self.ball.set_menu_open(False)
 
-        target = getattr(self.settings, 'control_target', 'coopanion') if getattr(self.settings, 'cast_mode', 'dual') == 'dual' else getattr(self.settings, 'cast_mode', 'coopanion')
+        target = self._active_target()
 
         if key == 'touch':
             self.renderer.send_command('touch', target=target)
@@ -395,16 +394,14 @@ class BigFishTitanApp:
             self._on_toggle_display_mode()
         elif key == 'panel':
             self._show_dashboard()
-        # 二级状态与生活入口
         elif key == 'status_balance':
             self._on_action_balance()
         elif key == 'status_weather':
             self._on_action_weather()
         elif key == 'status_todo':
-            self._on_pet_action('todo')
+            self._on_action_todo()
         elif key == 'status_sleep':
             self._on_pet_action('sleep_toggle')
-        # 二级表演与动作入口
         elif key == 'action_random':
             self._on_anim_requested('原地专心玩魔方')
         elif key == 'action_whisper':
@@ -415,26 +412,28 @@ class BigFishTitanApp:
             self._on_anim_requested('可爱宅舞')
         elif key == 'action_rub':
             self._on_meme_requested('吃饱饱摸肚子')
-        # 三级动作转盘点播 (全量 114 款动作)
         elif key.startswith('anim:'):
             anim_name = key[len('anim:'):]
             self._on_anim_requested(anim_name)
 
     def _on_action_balance(self):
         log.info('用户请求刷新余额')
-        bal = getattr(self.dsh_client, 'last_balance', '') or '¥22.74'
-        tier = getattr(self.dsh_client, 'last_tier', 'normal') or 'normal'
-
-        self.renderer.send_command('say', text=f'💰 DeepSeek 账户余额：{bal}', meme='token给妈妈保管')
         self.renderer.send_command('anim', name='余额-金袋叮当')
-        self.renderer.send_command('balance', balance=bal, tier=tier)
+        cached_bal = getattr(self.dsh_client, 'last_balance', '')
+        if cached_bal:
+            self.renderer.send_command('say', text=f'💰 DeepSeek 账户余额：{cached_bal}', meme='token给妈妈保管')
+            self.renderer.send_command('balance', balance=cached_bal, tier=getattr(self.dsh_client, 'last_tier', 'normal'))
+        else:
+            self.renderer.send_command('say', text='💰 正在查询 DeepSeek 账户余额…', meme='token给妈妈保管')
 
         def _fetch():
             try:
                 ok, new_bal, new_tier = self.dsh_client.trigger_balance()
-                if ok and new_bal:
+                if new_bal:
                     self.renderer.send_command('say', text=f'💰 DeepSeek 账户余额：{new_bal}', meme='token给妈妈保管')
                     self.renderer.send_command('balance', balance=new_bal, tier=new_tier)
+                elif not ok:
+                    self.renderer.send_command('say', text='💰 暂未获取到余额，请确认 DeepSeek Harness 已启动', meme='压力一只大肥鱼')
             except Exception as e:
                 log.warning('异步刷新余额异常: %s', e)
 
@@ -442,17 +441,24 @@ class BigFishTitanApp:
 
     def _on_action_weather(self):
         log.info('用户请求查询天气')
-        threading.Thread(target=self.dsh_client.trigger_weather, daemon=True).start()
+        self.renderer.send_command('say', text='⛅ 正在查询实时环境与天气…', meme='可爱')
+        threading.Thread(target=self.dsh_client.trigger_environment, daemon=True).start()
+
+    def _on_action_todo(self):
+        log.info('用户请求查询待办事项')
+        self.renderer.send_command('anim', name='轻快记录')
+        threading.Thread(target=self.dsh_client.trigger_todos, daemon=True).start()
 
     def _on_env_changed(self, city: str, weather: str):
         log.info('环境状态更新: %s · %s', city, weather)
 
     def _on_action_whisper(self):
         log.info('用户请求触发碎碎念')
-        threading.Thread(target=self.dsh_client.trigger_whisper, daemon=True).start()
-
-    def _on_chat_sent(self, text: str):
-        self.renderer.send_command('say', text=text, meme='吃白饭的大肥鱼')
+        def _do_whisper():
+            ok = self.dsh_client.trigger_whisper()
+            if not ok:
+                self.renderer.send_command('say', text='主人今天也在认真忙什么呀~ 摸摸鱼吧！', meme='吃白饭的大肥鱼')
+        threading.Thread(target=_do_whisper, daemon=True).start()
 
     def _on_toggle_display_mode(self, target: bool | None = None):
         """双屏模式切换：
@@ -486,18 +492,17 @@ class BigFishTitanApp:
         self._sync_desktop_pet_visibility()
 
     def _on_bg_changed(self, mode: str, value: Any):
-        if mode == 'dots' or mode == 'color':
+        if mode in ('dots', 'color'):
             self.renderer.send_command('background', type=mode, val=value if mode == 'color' else '')
         elif mode == 'image' and isinstance(value, str):
-            filename = os.path.basename(value)
-            self.renderer.send_command('background', type='image', val=f'/assets/backgrounds/{filename}')
+            self.renderer.send_command('background', type='image', val=value)
 
     def _sync_desktop_pet_visibility(self):
         """定时看门狗：根据推流开关、投放模式与互斥开关，原子同步桌面桌宠。"""
         s = self.settings.snapshot()
         mode = s.get('cast_mode', 'dual')
-        c_coop = s.get('cast_coopanion', True)
-        c_dsh = s.get('cast_dsh', True)
+        c_coop = mode in ('coopanion', 'dual')
+        c_dsh = mode in ('dsh', 'dual')
         pushing = s.get('pushing', True)
         hide_desktop = s.get('hide_desktop_pet', True)
 
@@ -520,7 +525,7 @@ class BigFishTitanApp:
         self.dashboard.activateWindow()
 
     def _on_tray_activated(self, reason):
-        if reason == QtWidgets.QSystemTrayIcon.DoubleClick:
+        if reason in (QtWidgets.QSystemTrayIcon.DoubleClick, QtWidgets.QSystemTrayIcon.Trigger):
             self._show_dashboard()
 
     def _on_ipc_incoming(self):
@@ -536,22 +541,14 @@ class BigFishTitanApp:
     def start(self):
         """拉起后台线程与前端界面。"""
         log.info('BigFishTitanConsole 正在启动...')
-        # 1. 启动硬件推流
         self.pusher.start()
-
-        # 2. 启动舞台无头渲染
         self.renderer.start()
-        init_bubble = getattr(self.settings, 'bubble_scale', 1.0)
-        self.renderer.send_command('bubble_scale', scale=init_bubble)
-
-        # 3. 启动 DSH 状态长轮询
         self.dsh_client.start_polling()
-
-        # 4. 显示桌面悬浮球
         self.ball.show()
+        if '--autostart' not in sys.argv and '--minimized' not in sys.argv:
+            self._show_dashboard()
 
-        # 5. 初始同步桌面端桌宠显隐
-        QtCore.QTimer.singleShot(500, self._sync_desktop_pet_visibility)
+        QtCore.QTimer.singleShot(400, self._sync_desktop_pet_visibility)
 
         log.info('BigFishTitanConsole 启动成功，就绪。')
         return self.qapp.exec()
@@ -560,6 +557,9 @@ class BigFishTitanApp:
         """安全停止并退出应用。"""
         log.info('BigFishTitanConsole 正在安全退出...')
         self._pet_visible_timer.stop()
+
+        # 落盘未保存的防抖配置
+        self.settings.flush()
 
         # 恢复桌面桌宠
         restore_all_desktop_pets(self.dsh_client)
