@@ -425,6 +425,32 @@ def _draw_back(painter: QPainter, cx: float, cy: float, size: float, color: QCol
     painter.drawLine(QPointF(cx - r * 0.5 - ah, cy - r * 0.5), QPointF(cx - r * 0.5, cy - r * 0.5 + ah))
 
 
+def _draw_switch_target(painter: QPainter, cx: float, cy: float, size: float, color: QColor):
+    """refresh-cw 风格：双宠控制切换环形双箭头"""
+    _pen(painter, size, color)
+    r = size * 0.32
+    rect = QRectF(cx - r, cy - r, r * 2, r * 2)
+    path1 = QPainterPath()
+    path1.arcMoveTo(rect, 30)
+    path1.arcTo(rect, 30, 130)
+    painter.drawPath(path1)
+
+    path2 = QPainterPath()
+    path2.arcMoveTo(rect, 210)
+    path2.arcTo(rect, 210, 130)
+    painter.drawPath(path2)
+
+    ah = size * 0.13
+    # 左上箭头
+    p1 = QPointF(cx + r * math.cos(math.radians(160)), cy - r * math.sin(math.radians(160)))
+    painter.drawLine(p1, QPointF(p1.x() - ah * 0.2, p1.y() - ah))
+    painter.drawLine(p1, QPointF(p1.x() + ah, p1.y() - ah * 0.3))
+    # 右下箭头
+    p2 = QPointF(cx + r * math.cos(math.radians(-20)), cy - r * math.sin(math.radians(-20)))
+    painter.drawLine(p2, QPointF(p2.x() + ah * 0.2, p2.y() + ah))
+    painter.drawLine(p2, QPointF(p2.x() - ah, p2.y() + ah * 0.3))
+
+
 # ——— 公共派发入口 ———
 
 _ICON_MAP = {
@@ -439,6 +465,7 @@ _ICON_MAP = {
     'voice':          _draw_voice,
     'toggle_display': _draw_toggle_display,
     'display':        _draw_toggle_display,
+    'switch_target':  _draw_switch_target,
     'balance':        _draw_balance,
     'whisper':        _draw_whisper,
     'sub_status':     _draw_star,
